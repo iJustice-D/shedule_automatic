@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 from sqlmodel import Session, select
 
@@ -18,15 +19,20 @@ from app.core.timetable import (
     SLOT_CATEGORY_ONLINE_EXTRA,
     SLOT_CATEGORY_REGULAR,
     apply_timeslot_to_entry,
+    day_label,
+    delivery_mode_label,
     online_slot_matches_day,
+    online_slot_label,
     online_slot_numbers,
     pair_allowed_for_shift,
+    pair_label,
     room_required,
 )
 from app.core.week_scope import scopes_overlap
 from app.models import AppSetting, ChangeLog, Conflict, Group, GroupSubjectTeacher, OnlinePolicy, Room, Schedule, ScheduleEntry, Subject, Suggestion, Teacher, TeacherSubject
-from app.services.ai.dummy import DummyExplanationProvider
-from app.services.ai.gemini_provider import GeminiExplanationProvider
+from app.services.ai.base import AITestResult
+from app.services.ai.dummy_provider import DummyExplanationProvider
+from app.services.ai.factory import build_ai_settings, create_provider
 from app.services.conflicts.engine import ConflictEngine
 from app.services.exporters.context import build_schedule_context
 from app.services.exporters.docx_exporter import DocxExporter
@@ -74,10 +80,9 @@ class TimetableService:
         before = entry.model_dump()
         if payload.get("rename_teacher_to"):
             teacher = session.get(Teacher, entry.teacher_id)
-            teacher.editable_name = payload["rename_teacher_to"]
-            teacher.full_name = payload["rename_teacher_to"]
-            teacher.short_name = payload["rename_teacher_to"]
-            session.add(teacher)
+            if teacher is not None:
+                teacher.editable_name = str(payload["rename_teacher_to"]).strip()
+                session.add(teacher)
         if payload.get("reassign_teacher_id"):
             reassign_teacher_id = payload["reassign_teacher_id"]
             mapping = session.exec(
@@ -160,9 +165,19 @@ class TimetableService:
         return entry
 
     def create_teacher(self, session: Session, full_name: str, short_name: str | None, home_department_id: int, max_weekly_pairs: int) -> Teacher:
+        full_name = full_name.strip()
+        short_name = (short_name or "").strip()
+        if not full_name:
+            raise ValueError("Поле «ФИО» обязательно")
+        if not short_name:
+            raise ValueError("Поле «Краткое имя» обязательно")
+        if home_department_id < 1:
+            raise ValueError("Выберите отдел преподавателя")
+        if max_weekly_pairs < 1:
+            raise ValueError("Укажите корректную недельную нагрузку")
         teacher = Teacher(
             full_name=full_name,
-            short_name=short_name or full_name,
+            short_name=short_name,
             home_department_id=home_department_id,
             editable_name=full_name,
             max_weekly_pairs=max_weekly_pairs,
@@ -176,6 +191,9 @@ class TimetableService:
         teacher = session.get(Teacher, teacher_id)
         if teacher is None:
             raise ValueError("Преподаватель не найден.")
+        name = name.strip()
+        if not name:
+            raise ValueError("Заполните обязательные поля.")
         teacher.full_name = name
         teacher.short_name = name
         teacher.editable_name = name
@@ -205,7 +223,77 @@ class TimetableService:
             raise ValueError("Конфликт не найден.")
         suggestions = session.exec(select(Suggestion).where(Suggestion.conflict_id == conflict.id)).all()
         provider = self._provider(session)
-        return provider.explain_conflict(conflict, suggestions)
+        try:
+            return provider.explain_conflict(conflict, suggestions)
+        except Exception:
+            return self._fallback_provider("Не удалось подключиться к Gemini").explain_conflict(conflict, suggestions)
+
+    def summarize_schedule(self, session: Session, schedule_id: int) -> str:
+        schedule = session.get(Schedule, schedule_id)
+        if schedule is None:
+            raise ValueError("Расписание не найдено.")
+        entries = session.exec(select(ScheduleEntry).where(ScheduleEntry.schedule_id == schedule.id)).all()
+        conflicts = session.exec(select(Conflict).where(Conflict.schedule_id == schedule.id)).all()
+        group_ids = sorted({entry.group_id for entry in entries})
+        groups = [group for group in (session.get(Group, group_id) for group_id in group_ids) if group is not None]
+        provider = self._provider(session)
+        try:
+            return provider.summarize_schedule(schedule, entries, conflicts, groups)
+        except Exception:
+            return self._fallback_provider("Не удалось подключиться к Gemini").summarize_schedule(schedule, entries, conflicts, groups)
+
+    def explain_last_manual_edit(self, session: Session, schedule_id: int) -> str:
+        change = session.exec(
+            select(ChangeLog).where(
+                ChangeLog.schedule_id == schedule_id,
+                ChangeLog.action_type == "update_entry",
+            ).order_by(ChangeLog.created_at.desc(), ChangeLog.id.desc())
+        ).first()
+        if change is None:
+            return "Изменение пока не найдено."
+        before = json.loads(change.before_json or "{}")
+        after = json.loads(change.after_json or "{}")
+        remaining_conflicts = session.exec(select(Conflict).where(Conflict.schedule_id == schedule_id)).all()
+        provider = self._provider(session)
+        before_view = self._entry_snapshot(session, before)
+        after_view = self._entry_snapshot(session, after)
+        try:
+            return provider.explain_manual_edit(before_view, after_view, remaining_conflicts)
+        except Exception:
+            return self._fallback_provider("Не удалось подключиться к Gemini").explain_manual_edit(
+                before_view,
+                after_view,
+                remaining_conflicts,
+            )
+
+    def save_ai_settings(
+        self,
+        session: Session,
+        *,
+        enabled: bool,
+        api_key: str,
+        model: str,
+        timeout: int,
+    ) -> None:
+        payload = {
+            "ai_enabled": "true" if enabled else "false",
+            "ai_provider": "gemini",
+            "gemini_api_key": api_key.strip(),
+            "gemini_model": model.strip() or settings.gemini_model,
+            "gemini_timeout": str(max(5, int(timeout))),
+            "ui_language": "ru",
+        }
+        for key, value in payload.items():
+            item = session.exec(select(AppSetting).where(AppSetting.key == key)).first()
+            if item is None:
+                item = AppSetting(key=key, value=value)
+            else:
+                item.value = value
+            session.add(item)
+        session.commit()
+
+    def test_ai_connection(self, session: Session, overrides: dict[str, Any] | None = None) -> AITestResult:
+        return self._provider(session, overrides).test_connection()
 
     def upsert_course_online_target(self, session: Session, course: int, target: int, note: str = "") -> OnlinePolicy:
         return self.online_policy_service.upsert_course_target(session, course, target, note=note)
@@ -240,12 +328,8 @@ class TimetableService:
             note=note,
         )
 
-    def _provider(self, session: Session):
-        ai_provider = self._setting(session, "ai_provider") or settings.ai_provider
-        gemini_api_key = self._setting(session, "gemini_api_key") or settings.gemini_api_key
-        if ai_provider == "gemini":
-            return GeminiExplanationProvider(gemini_api_key)
-        return DummyExplanationProvider()
+    def _provider(self, session: Session, overrides: dict[str, Any] | None = None):
+        return create_provider(self._ai_settings(session, overrides))
 
     def _validate_slot_rules(self, group: Group | None, entry: ScheduleEntry) -> None:
         if entry.lesson_mode == LESSON_MODE_ONLINE:
@@ -340,3 +424,72 @@ class TimetableService:
     def _setting(session: Session, key: str) -> str:
         setting = session.exec(select(AppSetting).where(AppSetting.key == key)).first()
         return setting.value if setting else ""
+
+    def _settings_map(self, session: Session) -> dict[str, str]:
+        return {item.key: item.value for item in session.exec(select(AppSetting)).all()}
+
+    def _ai_settings(self, session: Session, overrides: dict[str, Any] | None = None):
+        values = self._settings_map(session)
+        if overrides:
+            values.update({key: value for key, value in overrides.items() if value is not None})
+        return build_ai_settings(values)
+
+    @staticmethod
+    def _fallback_provider(reason: str) -> DummyExplanationProvider:
+        return DummyExplanationProvider(
+            connection_message=reason,
+            fallback_notice=f"{reason}. Используется стандартный режим без ИИ",
+        )
+
+    def _online_slot_labels(self, session: Session) -> dict[int, str]:
+        settings_map = self._settings_map(session)
+        return {
+            slot: settings_map.get(f"online_slot_{slot}_label") or online_slot_label(slot)
+            for slot in online_slot_numbers()
+        }
+
+    def _entry_snapshot(self, session: Session, snapshot: dict[str, Any]) -> dict[str, str]:
+        lesson_mode = snapshot.get("lesson_mode") or LESSON_MODE_REGULAR
+        day_of_week = self._to_int(snapshot.get("day_of_week"))
+        pair_number = self._to_int(snapshot.get("pair_number"))
+        online_slot_number = self._to_int(snapshot.get("online_slot_number"))
+        subject_id = self._to_int(snapshot.get("subject_id"))
+        teacher_id = self._to_int(snapshot.get("teacher_id"))
+        room_id = self._to_int(snapshot.get("room_id"))
+        subject = session.get(Subject, subject_id) if subject_id else None
+        teacher = session.get(Teacher, teacher_id) if teacher_id else None
+        room = session.get(Room, room_id) if room_id else None
+        slot_labels = self._online_slot_labels(session)
+
+        if lesson_mode == LESSON_MODE_ONLINE:
+            slot_text = slot_labels.get(online_slot_number or 1, online_slot_label(online_slot_number or 1))
+            room_text = "Не требуется"
+        else:
+            slot_text = pair_label(pair_number) if pair_number else "Не указана"
+            room_text = room.code if room is not None else "Не указана"
+
+        return {
+            "subject": subject.name if subject is not None else "Не указан",
+            "lesson_type": "Онлайн" if lesson_mode == LESSON_MODE_ONLINE else "Очное занятие",
+            "day": day_label(day_of_week) if day_of_week else "Не указан",
+            "slot": slot_text,
+            "teacher": (teacher.editable_name or teacher.full_name) if teacher is not None else "Не указан",
+            "room": room_text,
+            "delivery_mode": delivery_mode_label(snapshot.get("delivery_mode") or "offline"),
+            "locked": "Да" if self._to_bool(snapshot.get("locked")) else "Нет",
+        }
+
+    @staticmethod
+    def _to_int(value: Any) -> int | None:
+        if value in (None, "", "null"):
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _to_bool(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}

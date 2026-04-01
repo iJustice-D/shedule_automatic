@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from typing import Any
 
 from fastapi import FastAPI
 from nicegui import ui
@@ -42,6 +43,22 @@ def tr(key: str, **kwargs: object) -> str:
     return t(key, lang=LANG, **kwargs)
 
 
+def required_label(label: str) -> str:
+    return f"{label} *"
+
+
+def normalized_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def add_help(element, hint: str | None = None, *, tooltip: str | None = None) -> None:
+    help_text = tooltip or hint
+    if help_text:
+        element.tooltip(help_text)
+    if hint:
+        ui.label(hint).classes("form-hint")
+
+
 def register_ui(app: FastAPI) -> None:
     ui.run_with(app, storage_secret=settings.secret_key, title=tr("app.title"), favicon="calendar_month")
 
@@ -72,6 +89,9 @@ def inject_styles() -> None:
           .entry-online { background: var(--online); }
           .entry-offline { background: var(--offline); }
           .entry-hybrid { background: #efe5ff; }
+          .form-hint { color: var(--muted); font-size: 0.8rem; line-height: 1.35; margin-top: -0.2rem; white-space: normal; }
+          .q-field__label { white-space: normal; line-height: 1.15; max-width: calc(100% - 32px); }
+          .q-field__bottom { padding-top: 0.25rem; }
         </style>
         """
     )
@@ -269,45 +289,84 @@ def teachers_page() -> None:
                 value=state["selected_teacher_id"],
                 label=tr("teachers.teacher_to_rename"),
                 on_change=lambda event: state.update({"selected_teacher_id": event.value}),
-            ).classes("w-80")
+            ).classes("w-full max-w-[34rem]").tooltip(tr("teachers.rename_teacher_hint"))
 
         render_management()
         with ui.row().classes("gap-3 mt-3"):
-            with ui.dialog() as create_dialog, ui.card().classes("panel-card p-4 min-w-[420px]"):
+            with ui.dialog() as create_dialog, ui.card().classes("panel-card p-6 min-w-[640px] max-w-[92vw]"):
                 ui.label(tr("teachers.create_demo_teacher")).classes("text-lg font-semibold")
-                full_name = ui.input(tr("teachers.full_name"))
-                short_name = ui.input(tr("teachers.short_name"))
-                department = ui.select(selection_options(departments, "code"), label=tr("common.department"))
-                max_pairs = ui.number(tr("teachers.max_weekly_pairs"), value=20, min=6, max=30)
-                ui.button(
-                    tr("common.save"),
-                    on_click=lambda: (
-                        _create_teacher(full_name.value, short_name.value, department.value, int(max_pairs.value or 20)),
-                        create_dialog.close(),
-                    ),
-                ).props("color=amber-8")
+                ui.label(tr("common.required_note")).classes("form-hint")
+                full_name = ui.input(
+                    required_label(tr("teachers.full_name")),
+                    placeholder=tr("teachers.full_name_placeholder"),
+                    validation=lambda value: None if normalized_text(value) else tr("teachers.validation_full_name"),
+                ).classes("w-full")
+                add_help(full_name, tr("teachers.full_name_hint"))
+                short_name = ui.input(
+                    required_label(tr("teachers.short_name")),
+                    placeholder=tr("teachers.short_name_placeholder"),
+                    validation=lambda value: None if normalized_text(value) else tr("teachers.validation_short_name"),
+                ).classes("w-full")
+                add_help(short_name, tr("teachers.short_name_hint"))
+                department = ui.select(
+                    selection_options(departments, "code"),
+                    label=required_label(tr("teachers.department")),
+                    validation=lambda value: None if value else tr("teachers.validation_department"),
+                ).classes("w-full")
+                add_help(department, tr("teachers.department_hint"))
+                max_pairs = ui.number(
+                    required_label(tr("teachers.max_weekly_pairs")),
+                    placeholder=tr("teachers.max_weekly_pairs_placeholder"),
+                    value=20,
+                    min=1,
+                    max=60,
+                    step=1,
+                    validation=lambda value: None if value is not None and 1 <= int(value) <= 60 else tr("teachers.validation_max_weekly_pairs"),
+                ).classes("w-full")
+                add_help(max_pairs, tr("teachers.max_weekly_pairs_hint"))
+
+                def _submit_teacher_dialog() -> None:
+                    is_valid = all(field.validate() for field in (full_name, short_name, department, max_pairs))
+                    if not is_valid:
+                        return
+                    if _create_teacher(full_name.value, short_name.value, department.value, int(max_pairs.value or 20)):
+                        create_dialog.close()
+
+                with ui.row().classes("justify-end gap-2 mt-2"):
+                    ui.button(tr("common.cancel"), on_click=create_dialog.close).props("flat color=dark")
+                    ui.button(tr("common.save"), on_click=_submit_teacher_dialog).props("color=amber-8")
             ui.button(tr("common.create"), on_click=create_dialog.open).props("color=amber-8")
-            rename_input = ui.input(tr("teachers.rename_teacher"))
+            rename_input = ui.input(
+                tr("teachers.rename_teacher"),
+                placeholder=tr("teachers.rename_teacher_placeholder"),
+            ).classes("w-[28rem]")
+            add_help(rename_input, tr("teachers.rename_teacher_hint"))
             ui.button(
                 tr("common.rename"),
                 on_click=lambda: _rename_selected_teacher(state["selected_teacher_id"], rename_input.value),
             ).props("outline color=dark")
 
-        def _create_teacher(full_name: str, short_name: str, department_id: int | None, max_pairs: int) -> None:
-            if not full_name or not department_id:
-                ui.notify(tr("teachers.need_teacher_and_department"), color="negative")
-                return
+        def _create_teacher(full_name: str, short_name: str, department_id: int | None, max_pairs: int) -> bool:
             with session_scope() as session:
-                service.create_teacher(session, full_name, short_name, department_id, max_pairs)
+                try:
+                    service.create_teacher(session, normalized_text(full_name), normalized_text(short_name), department_id or 0, max_pairs)
+                except ValueError as exc:
+                    ui.notify(str(exc), color="negative")
+                    return False
             ui.notify(tr("teachers.teacher_created"), color="positive")
             render_management.refresh()
+            return True
 
         def _rename_selected_teacher(teacher_id: int | None, new_name: str) -> None:
-            if not teacher_id or not new_name:
+            if not teacher_id or not normalized_text(new_name):
                 ui.notify(tr("common.required_fields"), color="negative")
                 return
             with session_scope() as session:
-                service.rename_teacher(session, teacher_id, new_name)
+                try:
+                    service.rename_teacher(session, teacher_id, normalized_text(new_name))
+                except ValueError as exc:
+                    ui.notify(str(exc), color="negative")
+                    return
             ui.notify(tr("teachers.teacher_renamed"), color="positive")
             render_management.refresh()
 
@@ -615,6 +674,15 @@ def editor_page() -> None:
                         key=lambda item: item.rank,
                     ):
                         ui.label(f"{suggestion.rank}. {suggestion.message}")
+                    ui.button(
+                        tr("conflicts.explain"),
+                        on_click=lambda c=conflict.id: _show_conflict_explanation(c or 0),
+                    ).props("outline color=dark").classes("mt-2").tooltip(tr("conflicts.explain_hint"))
+
+        def _show_conflict_explanation(conflict_id: int) -> None:
+            with session_scope() as session:
+                message = service.explain_conflict(session, conflict_id)
+            ui.notify(message, multi_line=True, timeout=10000)
 
         def open_edit_dialog(entry_id: int) -> None:
             with session_scope() as session:
@@ -633,53 +701,165 @@ def editor_page() -> None:
                 subjects_local = [session.get(Subject, load.subject_id) for load in loads]
             subject_options = {subject.id or 0: subject.name for subject in subjects_local if subject is not None}
             room_options = {0: tr("editor.remove_room"), **selection_options(rooms_local, "code")}
-            with ui.dialog() as dialog, ui.card().classes("panel-card p-4 min-w-[520px]"):
+            regular_pair_options = {
+                number: f"{pair_label(number, lang=LANG)} | {pair_time_range(number, lang=LANG)}"
+                for number in allowed_pairs_for_shift(group.shift if group else entry.shift)
+            }
+            slot_options = {
+                slot: f"{slot_labels[slot]} | {day_label(online_slot_day(slot), lang=LANG)}"
+                for slot in online_slot_numbers()
+            }
+
+            def _required_value(value: Any, message: str) -> str | None:
+                return None if value not in (None, "", 0) else message
+
+            with ui.dialog() as dialog, ui.card().classes("panel-card p-6 min-w-[760px] max-w-[95vw]"):
                 ui.label(tr("editor.edit_entry")).classes("text-lg font-semibold")
-                subject_id = ui.select(subject_options, value=entry.subject_id, label=tr("editor.change_subject"))
-                lesson_mode = ui.select(lesson_mode_options(), value=entry.lesson_mode, label=tr("editor.change_lesson_mode"))
-                day_of_week = ui.select({day: day_label(day, lang=LANG) for day in DAYS}, value=entry.day_of_week, label=tr("editor.change_day"))
+                ui.label(tr("common.required_note")).classes("form-hint")
+                subject_id = ui.select(
+                    subject_options,
+                    value=entry.subject_id,
+                    label=required_label(tr("editor.change_subject")),
+                    validation=lambda value: _required_value(value, tr("editor.validation_subject")),
+                ).classes("w-full")
+                add_help(subject_id, tr("editor.subject_hint"))
+                lesson_mode = ui.select(
+                    lesson_mode_options(),
+                    value=entry.lesson_mode,
+                    label=required_label(tr("editor.change_lesson_mode")),
+                    validation=lambda value: _required_value(value, tr("editor.validation_lesson_mode")),
+                ).classes("w-full")
+                add_help(lesson_mode, tr("editor.lesson_mode_hint"))
+                day_of_week = ui.select(
+                    {day: day_label(day, lang=LANG) for day in DAYS},
+                    value=entry.day_of_week,
+                    label=required_label(tr("editor.change_day")),
+                    validation=lambda value: _required_value(value, tr("editor.validation_day")),
+                ).classes("w-full")
+                add_help(day_of_week, tr("editor.day_hint"))
                 pair_number = ui.select(
-                    {
-                        number: f"{pair_label(number, lang=LANG)} | {pair_time_range(number, lang=LANG)}"
-                        for number in allowed_pairs_for_shift(group.shift if group else entry.shift)
-                    },
+                    regular_pair_options,
                     value=entry.pair_number,
                     label=tr("editor.change_pair"),
-                )
+                    validation=lambda value: None if lesson_mode.value == LESSON_MODE_ONLINE or value else tr("editor.validation_pair"),
+                ).classes("w-full")
+                pair_number.tooltip(tr("editor.pair_hint"))
+                pair_hint = ui.label(tr("editor.pair_hint")).classes("form-hint")
                 online_slot_number = ui.select(
-                    {
-                        slot: f"{slot_labels[slot]} | {day_label(online_slot_day(slot), lang=LANG)}"
-                        for slot in online_slot_numbers()
-                    },
+                    slot_options,
                     value=entry.online_slot_number or 1,
                     label=tr("editor.change_online_slot"),
-                )
-                teacher_id = ui.select(selection_options(teachers_local, "full_name"), value=entry.teacher_id, label=tr("editor.change_teacher"))
-                room_id = ui.select(room_options, value=entry.room_id or 0, label=tr("editor.change_room"))
-                delivery_mode = ui.select(regular_delivery_options(), value=entry.delivery_mode if entry.delivery_mode != "online" else "offline", label=tr("editor.change_mode"))
+                    validation=lambda value: None if lesson_mode.value != LESSON_MODE_ONLINE or value else tr("editor.validation_online_slot"),
+                ).classes("w-full")
+                online_slot_number.tooltip(tr("editor.online_slot_hint"))
+                online_slot_hint = ui.label(tr("editor.online_slot_hint")).classes("form-hint")
+                teacher_id = ui.select(
+                    selection_options(teachers_local, "full_name"),
+                    value=entry.teacher_id,
+                    label=required_label(tr("editor.change_teacher")),
+                    validation=lambda value: _required_value(value, tr("editor.validation_teacher")),
+                ).classes("w-full")
+                add_help(teacher_id, tr("editor.teacher_hint"))
+                room_id = ui.select(
+                    room_options,
+                    value=entry.room_id or 0,
+                    label=tr("editor.change_room"),
+                    validation=lambda value: None if lesson_mode.value == LESSON_MODE_ONLINE or delivery_mode.value == "online" or value not in (None, 0) else tr("editor.validation_room"),
+                ).classes("w-full")
+                room_id.tooltip(tr("editor.room_hint"))
+                room_hint = ui.label(tr("editor.room_hint")).classes("form-hint")
+                delivery_mode = ui.select(
+                    delivery_options(),
+                    value=entry.delivery_mode,
+                    label=required_label(tr("editor.change_mode")),
+                ).classes("w-full")
+                add_help(delivery_mode, tr("editor.mode_hint"))
                 locked = ui.switch(tr("editor.lock"), value=entry.locked)
-                rename_teacher = ui.input(tr("editor.rename_current_teacher"))
-                reassign_teacher = ui.select(selection_options(teachers_local, "full_name"), label=tr("editor.reassign_teacher"))
-                ui.button(
-                    tr("common.save"),
-                    on_click=lambda: _save_entry(
-                        entry_id,
-                        _entry_payload(
-                            subject_id=subject_id.value,
-                            lesson_mode=lesson_mode.value,
-                            day_of_week=day_of_week.value,
-                            pair_number=pair_number.value,
-                            online_slot_number=online_slot_number.value,
-                            teacher_id=teacher_id.value,
-                            room_id=room_id.value,
-                            delivery_mode=delivery_mode.value,
-                            locked=bool(locked.value),
-                            rename_teacher_to=rename_teacher.value or None,
-                            reassign_teacher_id=reassign_teacher.value or None,
+                add_help(locked, tr("editor.lock_hint"))
+                rename_teacher = ui.input(
+                    tr("editor.rename_current_teacher"),
+                    placeholder=tr("editor.rename_current_teacher_placeholder"),
+                ).classes("w-full")
+                add_help(rename_teacher, tr("editor.rename_current_teacher_hint"))
+                reassign_teacher = ui.select(
+                    selection_options(teachers_local, "full_name"),
+                    label=tr("editor.reassign_teacher"),
+                ).classes("w-full")
+                add_help(reassign_teacher, tr("editor.reassign_teacher_hint"))
+
+                sync_state = {"active": False}
+
+                def _sync_edit_form() -> None:
+                    if sync_state["active"]:
+                        return
+                    sync_state["active"] = True
+                    try:
+                        is_online = lesson_mode.value == LESSON_MODE_ONLINE or delivery_mode.value == "online"
+                        if is_online:
+                            if lesson_mode.value != LESSON_MODE_ONLINE:
+                                lesson_mode.set_value(LESSON_MODE_ONLINE)
+                            if delivery_mode.value != "online":
+                                delivery_mode.set_value("online")
+                            if not online_slot_number.value:
+                                online_slot_number.set_value(1)
+                            day_of_week.set_value(online_slot_day(int(online_slot_number.value or 1)))
+                            pair_number.set_visibility(False)
+                            pair_hint.set_visibility(False)
+                            pair_number.disable()
+                            online_slot_number.set_visibility(True)
+                            online_slot_hint.set_visibility(True)
+                            online_slot_number.enable()
+                            day_of_week.disable()
+                            room_id.set_value(0)
+                            room_id.disable()
+                        else:
+                            if lesson_mode.value != LESSON_MODE_REGULAR:
+                                lesson_mode.set_value(LESSON_MODE_REGULAR)
+                            if delivery_mode.value == "online":
+                                delivery_mode.set_value("offline")
+                            if pair_number.value not in regular_pair_options:
+                                pair_number.set_value(next(iter(regular_pair_options)))
+                            pair_number.set_visibility(True)
+                            pair_hint.set_visibility(True)
+                            pair_number.enable()
+                            online_slot_number.set_visibility(False)
+                            online_slot_hint.set_visibility(False)
+                            online_slot_number.disable()
+                            day_of_week.enable()
+                            room_id.enable()
+                    finally:
+                        sync_state["active"] = False
+                    for field in (subject_id, lesson_mode, day_of_week, pair_number, online_slot_number, teacher_id, room_id):
+                        field.validate()
+
+                lesson_mode.on_value_change(lambda _: _sync_edit_form())
+                delivery_mode.on_value_change(lambda _: _sync_edit_form())
+                online_slot_number.on_value_change(lambda _: _sync_edit_form())
+                _sync_edit_form()
+
+                with ui.row().classes("justify-end gap-2 mt-2"):
+                    ui.button(tr("common.cancel"), on_click=dialog.close).props("flat color=dark")
+                    ui.button(
+                        tr("common.save"),
+                        on_click=lambda: _save_entry(
+                            entry_id,
+                            _entry_payload(
+                                subject_id=subject_id.value,
+                                lesson_mode=lesson_mode.value,
+                                day_of_week=day_of_week.value,
+                                pair_number=pair_number.value,
+                                online_slot_number=online_slot_number.value,
+                                teacher_id=teacher_id.value,
+                                room_id=room_id.value,
+                                delivery_mode=delivery_mode.value,
+                                locked=bool(locked.value),
+                                rename_teacher_to=normalized_text(rename_teacher.value) or None,
+                                reassign_teacher_id=reassign_teacher.value or None,
+                            ),
+                            dialog,
+                            validators=[subject_id, lesson_mode, day_of_week, pair_number, online_slot_number, teacher_id, room_id],
                         ),
-                        dialog,
-                    ),
-                ).props("color=amber-8")
+                    ).props("color=amber-8")
             dialog.open()
 
         def _entry_payload(
@@ -724,17 +904,29 @@ def editor_page() -> None:
                 "reassign_teacher_id": reassign_teacher_id,
             }
 
-        def _save_entry(entry_id: int, payload: dict, dialog) -> None:
+        def _save_entry(entry_id: int, payload: dict, dialog, validators: list) -> None:
+            if not all(field.validate() for field in validators):
+                return
             try:
                 with session_scope() as session:
-                    service.update_entry(session, entry_id, payload)
+                    updated = service.update_entry(session, entry_id, payload)
+                    manual_edit_message = service.explain_last_manual_edit(session, updated.schedule_id)
             except ValueError as exc:
                 ui.notify(tr("editor.save_failed", message=str(exc)), color="negative", multi_line=True)
                 return
             dialog.close()
             ui.notify(tr("editor.entry_updated"), color="positive")
+            ui.notify(manual_edit_message, color="info", multi_line=True, timeout=9000)
             render_grid.refresh()
             render_feedback.refresh()
+
+        def _show_schedule_summary() -> None:
+            if not state["schedule_id"]:
+                ui.notify(tr("notify.select_schedule"), color="negative")
+                return
+            with session_scope() as session:
+                message = service.summarize_schedule(session, int(state["schedule_id"]))
+            ui.notify(message, multi_line=True, timeout=10000)
 
         with ui.row().classes("gap-3 w-full"):
             ui.select(
@@ -771,6 +963,7 @@ def editor_page() -> None:
                 label=tr("editor.shift_filter"),
                 on_change=lambda event: (state.update({"shift_filter": event.value}), render_grid.refresh()),
             )
+        ui.button(tr("editor.summary_button"), on_click=_show_schedule_summary).props("outline color=dark").classes("mt-3").tooltip(tr("editor.summary_hint"))
 
         render_grid()
         render_feedback()
@@ -808,7 +1001,7 @@ def conflicts_page() -> None:
                     ui.button(
                         tr("conflicts.explain"),
                         on_click=lambda c=conflict.id: _show_explanation(c or 0),
-                    ).props("outline color=dark").classes("mt-2")
+                    ).props("outline color=dark").classes("mt-2").tooltip(tr("conflicts.explain_hint"))
 
         def _show_explanation(conflict_id: int) -> None:
             with session_scope() as session:
@@ -876,26 +1069,83 @@ def settings_page() -> None:
                 ).all()
             }
 
-        ui.label(tr("settings.online_policy")).classes("text-xl font-semibold")
+        ui.label(tr("settings.ai_section")).classes("text-xl font-semibold")
         with ui.card().classes("panel-card p-4 w-full"):
-            ui.label(tr("settings.ai_provider")).classes("text-lg font-semibold")
-            provider = ui.select({"dummy": "Без ИИ", "gemini": "Gemini"}, value=current_settings.get("ai_provider", "dummy"), label=tr("settings.ai_provider")).classes("w-80")
-            gemini_key = ui.input(tr("settings.gemini_key"), password=True, password_toggle_button=True, value=current_settings.get("gemini_api_key", "")).classes("w-full")
+            ai_enabled = ui.switch(
+                tr("settings.ai_enabled"),
+                value=current_settings.get("ai_enabled", "false").lower() == "true",
+            )
+            add_help(ai_enabled, tr("settings.ai_enabled_hint"))
+            gemini_key = ui.input(
+                tr("settings.gemini_key"),
+                placeholder=tr("settings.gemini_key_placeholder"),
+                password=True,
+                password_toggle_button=True,
+                value=current_settings.get("gemini_api_key", ""),
+            ).classes("w-full")
+            add_help(gemini_key, tr("settings.gemini_key_hint"))
+            gemini_model = ui.input(
+                tr("settings.gemini_model"),
+                placeholder=tr("settings.gemini_model_placeholder"),
+                value=current_settings.get("gemini_model", settings.gemini_model),
+            ).classes("w-full")
+            add_help(gemini_model, tr("settings.gemini_model_hint"))
+            gemini_timeout = ui.number(
+                tr("settings.gemini_timeout"),
+                value=int(current_settings.get("gemini_timeout", settings.gemini_timeout)),
+                min=5,
+                max=120,
+                step=1,
+                validation=lambda value: None if value is not None and 5 <= int(value) <= 120 else tr("common.required_fields"),
+            ).classes("w-full max-w-[18rem]")
+            add_help(gemini_timeout, tr("settings.gemini_timeout_hint"))
             ui.label(tr("settings.ai_note")).classes("text-sm text-[#6b7280]")
+
+            def _sync_ai_inputs() -> None:
+                is_enabled = bool(ai_enabled.value)
+                gemini_key.set_enabled(is_enabled)
+                gemini_model.set_enabled(is_enabled)
+                gemini_timeout.set_enabled(is_enabled)
+
+            ai_enabled.on_value_change(lambda _: _sync_ai_inputs())
+            _sync_ai_inputs()
 
             def _save_ai_settings() -> None:
                 with session_scope() as session:
-                    for key, value in {"ai_provider": provider.value, "gemini_api_key": gemini_key.value, "ui_language": "ru"}.items():
-                        item = session.exec(select(AppSetting).where(AppSetting.key == key)).first()
-                        if item is None:
-                            item = AppSetting(key=key, value=value)
-                        else:
-                            item.value = value
-                        session.add(item)
-                    session.commit()
+                    service.save_ai_settings(
+                        session,
+                        enabled=bool(ai_enabled.value),
+                        api_key=gemini_key.value or "",
+                        model=gemini_model.value or settings.gemini_model,
+                        timeout=int(gemini_timeout.value or settings.gemini_timeout),
+                    )
                 ui.notify(tr("settings.saved"), color="positive")
+                if not ai_enabled.value:
+                    ui.notify(tr("settings.ai_disabled"), color="warning")
+                elif not normalized_text(gemini_key.value):
+                    ui.notify(tr("settings.standard_mode"), color="warning")
 
-            ui.button(tr("settings.save_settings"), on_click=_save_ai_settings).props("color=amber-8")
+            def _test_ai_connection() -> None:
+                with session_scope() as session:
+                    result = service.test_ai_connection(
+                        session,
+                        {
+                            "ai_enabled": bool(ai_enabled.value),
+                            "ai_provider": "gemini",
+                            "gemini_api_key": gemini_key.value or "",
+                            "gemini_model": gemini_model.value or settings.gemini_model,
+                            "gemini_timeout": int(gemini_timeout.value or settings.gemini_timeout),
+                        },
+                    )
+                ui.notify(result.message, color="positive" if result.success else "negative")
+                if not result.success and result.message != tr("settings.standard_mode"):
+                    ui.notify(tr("settings.standard_mode"), color="warning")
+
+            with ui.row().classes("gap-3 mt-2"):
+                ui.button(tr("settings.save_settings"), on_click=_save_ai_settings).props("color=amber-8")
+                ui.button(tr("settings.test_connection"), on_click=_test_ai_connection).props("outline color=dark")
+
+        ui.label(tr("settings.online_policy")).classes("text-xl font-semibold mt-6")
 
         with ui.card().classes("panel-card p-4 w-full mt-4"):
             ui.label(tr("settings.course_target")).classes("text-lg font-semibold")
