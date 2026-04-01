@@ -1,0 +1,1 @@
+"""College timetable MVP."""
