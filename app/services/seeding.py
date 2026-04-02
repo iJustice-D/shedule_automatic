@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from sqlmodel import Session, delete, select
 
+from app.core.load_planning import build_weekly_load_plan
 from app.core.timetable import (
     DELIVERY_OFFLINE,
     PAIR_DEFINITIONS,
@@ -260,31 +262,49 @@ class Seeder:
                     CurriculumLoad.semester == imported.semester,
                 )
             ).first()
-            if existing_load is None:
-                study_weeks = session.exec(
-                    select(AcademicPeriod).where(
-                        AcademicPeriod.group_id == group.id,
-                        AcademicPeriod.semester == imported.semester,
-                        AcademicPeriod.is_schedulable.is_(True),
-                    )
-                ).all()
-                session.add(
-                    CurriculumLoad(
-                        group_id=group.id or 0,
-                        subject_id=subject.id or 0,
-                        semester=imported.semester,
-                        total_hours=imported.schedulable_hours,
-                        study_weeks=len(study_weeks),
-                        hours_per_week=round(imported.schedulable_hours / max(len(study_weeks), 1), 2),
-                        pairs_per_week=round(imported.schedulable_hours / 2 / max(len(study_weeks), 1), 2),
-                        lesson_type=imported.lesson_type,
-                        delivery_mode=imported.default_delivery_mode,
-                        raw_total_hours=imported.raw_total_hours,
-                        practice_hours=imported.practice_hours,
-                        source_code=imported.subject_code,
-                    )
+            study_weeks = session.exec(
+                select(AcademicPeriod).where(
+                    AcademicPeriod.group_id == group.id,
+                    AcademicPeriod.semester == imported.semester,
+                    AcademicPeriod.is_schedulable.is_(True),
                 )
-                session.commit()
+            ).all()
+            plan = build_weekly_load_plan(imported.schedulable_hours, [item.week_number for item in study_weeks])
+            if existing_load is None:
+                existing_load = CurriculumLoad(
+                    group_id=group.id or 0,
+                    subject_id=subject.id or 0,
+                    semester=imported.semester,
+                )
+            existing_load.total_hours = imported.schedulable_hours
+            existing_load.study_weeks = len(study_weeks)
+            existing_load.hours_per_week = round(imported.schedulable_hours / max(len(study_weeks), 1), 2)
+            existing_load.pairs_per_week = plan.target_pairs_per_week
+            existing_load.lesson_type = imported.lesson_type
+            existing_load.delivery_mode = imported.default_delivery_mode
+            existing_load.raw_total_hours = imported.raw_total_hours
+            existing_load.practice_hours = imported.practice_hours
+            existing_load.source_code = imported.subject_code
+            existing_load.details_json = json.dumps(
+                {
+                    "group_code": imported.group_code,
+                    "module_code": imported.module_code,
+                    "module_name": imported.module_name,
+                    "control_form": imported.control_form,
+                    "theory_hours": imported.theory_hours,
+                    "lab_hours": imported.lab_hours,
+                    "practice_hours": imported.practice_hours,
+                    "total_pairs_needed": plan.total_pairs_needed,
+                    "base_pairs_per_week": plan.base_pairs_per_week,
+                    "target_pairs_per_week": plan.target_pairs_per_week,
+                    "remainder_pairs": plan.remainder_pairs,
+                    "extra_weeks": plan.extra_weeks,
+                    "uneven_distribution_strategy": plan.uneven_distribution_strategy,
+                },
+                ensure_ascii=False,
+            )
+            session.add(existing_load)
+            session.commit()
 
             teacher_keys = teacher_plan.get(imported.subject_name, ["maksat"])
             self._ensure_teacher_mappings(session, group.id or 0, subject.id or 0, teacher_keys, teachers)

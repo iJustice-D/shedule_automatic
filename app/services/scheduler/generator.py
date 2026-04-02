@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 from collections import Counter
 from dataclasses import dataclass, field
 
 from sqlmodel import Session, select
 
+from app.core.load_planning import academic_hours_to_pairs, build_weekly_load_plan
 from app.core.timetable import (
     DAYS,
     DELIVERY_OFFLINE,
@@ -56,7 +58,17 @@ class GreedyScheduleGenerator:
         if group_codes:
             groups_query = groups_query.where(Group.code.in_(group_codes))
         groups = session.exec(groups_query.order_by(Group.code)).all()
-        schedule = Schedule(name=schedule_name or f"Расписание семестра {semester}", semester=semester)
+        schedule = Schedule(
+            name=schedule_name or f"Расписание семестра {semester}",
+            semester=semester,
+            details_json=json.dumps(
+                {
+                    "group_ids": [group.id for group in groups if group.id is not None],
+                    "group_codes": [group.code for group in groups],
+                },
+                ensure_ascii=False,
+            ),
+        )
         session.add(schedule)
         session.commit()
         session.refresh(schedule)
@@ -136,16 +148,20 @@ class GreedyScheduleGenerator:
         load: CurriculumLoad,
         study_weeks: list[int],
     ) -> list[SessionDemand]:
-        total_pairs = max(int(round(load.total_hours / 2)), 1)
+        total_pairs = max(academic_hours_to_pairs(load.total_hours), 1)
         base_pairs = total_pairs // len(study_weeks)
         extra_pairs = total_pairs % len(study_weeks)
+        plan = build_weekly_load_plan(load.total_hours, study_weeks)
         subject = session.get(Subject, load.subject_id)
         online_allowed = self.online_policy_service.is_subject_allowed_online(session, group, subject) if subject else False
         teacher_candidates = self._teacher_candidates(session, group.id or 0, load.subject_id)
         room_candidates = self._room_candidates(session, load.subject_id)
         common_metadata = {
             "total_hours": load.total_hours,
+            "total_pairs_needed": total_pairs,
             "study_weeks": len(study_weeks),
+            "base_pairs_per_week": plan.base_pairs_per_week,
+            "remainder_pairs": plan.remainder_pairs,
             "teacher_option_count": len(teacher_candidates),
             "room_option_count": len(room_candidates),
         }
@@ -529,6 +545,7 @@ class GreedyScheduleGenerator:
             ).all()
             if rooms:
                 return [room.id or 0 for room in rooms]
-            return []
+            rooms = session.exec(select(Room).order_by(Room.code)).all()
+            return [room.id or 0 for room in rooms]
         rooms = session.exec(select(Room).order_by(Room.code)).all()
         return [room.id or 0 for room in rooms]

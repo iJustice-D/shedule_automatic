@@ -159,6 +159,8 @@ def _migrate_sqlite_schema() -> None:
         _ensure_column(connection, "timeslot", "start_time", "VARCHAR DEFAULT ''")
         _ensure_column(connection, "timeslot", "end_time", "VARCHAR DEFAULT ''")
         _ensure_column(connection, "curriculumload", "delivery_mode", "VARCHAR DEFAULT 'offline'")
+        _ensure_column(connection, "curriculumload", "details_json", "VARCHAR DEFAULT ''")
+        _ensure_column(connection, "schedule", "details_json", "VARCHAR DEFAULT ''")
         _recreate_scheduleentry_if_needed(connection)
         _ensure_column(connection, "scheduleentry", "shift", "VARCHAR DEFAULT ''")
         _ensure_column(connection, "scheduleentry", "start_time", "VARCHAR DEFAULT ''")

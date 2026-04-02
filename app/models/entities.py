@@ -89,6 +89,7 @@ class CurriculumLoad(SQLModel, table=True):
     raw_total_hours: int = 0
     practice_hours: int = 0
     source_code: str = ""
+    details_json: str = ""
 
 
 class TeacherSubject(SQLModel, table=True):
@@ -111,6 +112,7 @@ class Schedule(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str
     semester: int = Field(index=True)
+    details_json: str = ""
     created_at: datetime = Field(default_factory=utcnow)
 
 

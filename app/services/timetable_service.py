@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 import json
 from pathlib import Path
 from typing import Any
@@ -7,7 +8,9 @@ from typing import Any
 from sqlmodel import Session, select
 
 from app.core.config import settings
+from app.core.load_planning import build_weekly_load_plan
 from app.core.timetable import (
+    DAYS,
     DELIVERY_HYBRID,
     DELIVERY_OFFLINE,
     DELIVERY_ONLINE,
@@ -24,12 +27,13 @@ from app.core.timetable import (
     online_slot_matches_day,
     online_slot_label,
     online_slot_numbers,
+    allowed_pairs_for_shift,
     pair_allowed_for_shift,
     pair_label,
     room_required,
 )
 from app.core.week_scope import scopes_overlap
-from app.models import AppSetting, ChangeLog, Conflict, Group, GroupSubjectTeacher, OnlinePolicy, Room, Schedule, ScheduleEntry, Subject, Suggestion, Teacher, TeacherSubject
+from app.models import AcademicPeriod, AppSetting, ChangeLog, Conflict, CurriculumLoad, Department, Group, GroupSubjectTeacher, OnlinePolicy, Room, Schedule, ScheduleEntry, Subject, Suggestion, Teacher, TeacherSubject
 from app.services.ai.base import AITestResult
 from app.services.ai.dummy_provider import DummyExplanationProvider
 from app.services.ai.factory import build_ai_settings, create_provider
@@ -38,6 +42,8 @@ from app.services.exporters.context import build_schedule_context
 from app.services.exporters.docx_exporter import DocxExporter
 from app.services.exporters.pdf_exporter import PdfExporter
 from app.services.exporters.xlsx_exporter import XlsxExporter
+from app.services.importers.academic_calendar_pdf import AcademicCalendarPdfImporter
+from app.services.importers.curriculum_xls import CurriculumXlsImporter
 from app.services.online_policy import OnlinePolicyService
 from app.services.scheduler.generator import GreedyScheduleGenerator
 from app.services.suggestions.engine import SuggestionEngine
@@ -52,6 +58,8 @@ class TimetableService:
         self.pdf_exporter = PdfExporter()
         self.docx_exporter = DocxExporter()
         self.online_policy_service = OnlinePolicyService()
+        self.curriculum_importer = CurriculumXlsImporter()
+        self.calendar_importer = AcademicCalendarPdfImporter()
 
     def generate_schedule(
         self,
@@ -71,6 +79,232 @@ class TimetableService:
         conflicts = self.conflict_engine.refresh(session, schedule)
         suggestions = self.suggestion_engine.refresh(session, schedule)
         return conflicts, suggestions
+
+    def preview_curriculum_import(self, path: str | Path, group_code: str = "ETB-1124-1") -> dict[str, Any]:
+        source = Path(path).expanduser()
+        if not source.exists():
+            raise ValueError("Файл учебного плана не найден.")
+        preview = self.curriculum_importer.preview_group_loads(source, group_code=group_code, semesters=(3, 4))
+        return {
+            "file_name": preview.file_name,
+            "file_path": preview.file_path,
+            "detected_group_code": preview.detected_group_code,
+            "detected_specialty": preview.detected_specialty,
+            "detected_qualification": preview.detected_qualification,
+            "sheet_name": preview.sheet_name,
+            "semester_totals": preview.semester_totals,
+            "warnings": preview.warnings,
+            "rows": [self._curriculum_row_to_dict(item) for item in preview.rows],
+        }
+
+    def apply_curriculum_import(self, session: Session, group_code: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
+        if not rows:
+            raise ValueError("Нет строк учебного плана для сохранения.")
+        group = self._ensure_group(session, group_code)
+        semesters = sorted({int(row["semester"]) for row in rows})
+
+        existing = session.exec(
+            select(CurriculumLoad).where(
+                CurriculumLoad.group_id == group.id,
+                CurriculumLoad.semester.in_(semesters),
+            )
+        ).all()
+        for item in existing:
+            session.delete(item)
+        session.commit()
+
+        saved = 0
+        for row in rows:
+            subject = self._upsert_subject_from_curriculum_row(session, group, row)
+            self._ensure_default_teacher_mapping(session, group.id or 0, subject.id or 0, str(row.get("subject_name") or row.get("module_name") or ""))
+            study_weeks = self._study_weeks(session, group.id or 0, int(row["semester"]))
+            plan = build_weekly_load_plan(int(row.get("schedulable_hours") or 0), study_weeks)
+            load = CurriculumLoad(
+                group_id=group.id or 0,
+                subject_id=subject.id or 0,
+                semester=int(row["semester"]),
+                total_hours=int(row.get("schedulable_hours") or 0),
+                study_weeks=len(study_weeks),
+                hours_per_week=round(int(row.get("schedulable_hours") or 0) / max(len(study_weeks), 1), 2),
+                pairs_per_week=plan.target_pairs_per_week,
+                lesson_type=str(row.get("lesson_type") or subject.lesson_type or "lecture"),
+                delivery_mode=str(row.get("default_delivery_mode") or subject.default_delivery_mode or DELIVERY_OFFLINE),
+                raw_total_hours=int(row.get("raw_total_hours") or 0),
+                practice_hours=int(row.get("practice_hours") or 0),
+                source_code=str(row.get("subject_code") or ""),
+                details_json=json.dumps(
+                    {
+                        "group_code": group.code,
+                        "module_code": row.get("module_code") or self._module_code_from_source(str(row.get("subject_code") or "")),
+                        "module_name": row.get("module_name") or row.get("subject_name"),
+                        "control_form": row.get("control_form") or "не указано",
+                        "theory_hours": int(row.get("theory_hours") or 0),
+                        "lab_hours": int(row.get("lab_hours") or 0),
+                        "practice_hours": int(row.get("practice_hours") or 0),
+                        "total_pairs_needed": plan.total_pairs_needed,
+                        "base_pairs_per_week": plan.base_pairs_per_week,
+                        "target_pairs_per_week": plan.target_pairs_per_week,
+                        "remainder_pairs": plan.remainder_pairs,
+                        "remainder_hours": plan.remainder_hours,
+                        "extra_weeks": plan.extra_weeks,
+                        "uneven_distribution_strategy": plan.uneven_distribution_strategy,
+                        "warnings": row.get("warnings") or [],
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+            session.add(load)
+            saved += 1
+        session.commit()
+        return {"group_code": group.code, "rows_saved": saved, "semesters": semesters}
+
+    def preview_academic_calendar_import(self, path: str | Path, group_code: str = "ETB-1124-1") -> dict[str, Any]:
+        source = Path(path).expanduser()
+        if not source.exists():
+            raise ValueError("Файл учебного процесса не найден.")
+        preview = self.calendar_importer.preview_group_periods(source, group_code)
+        return {
+            "file_name": preview.file_name,
+            "file_path": preview.file_path,
+            "detected_group_code": preview.detected_group_code,
+            "row_excerpt": preview.row_excerpt,
+            "warnings": preview.warnings,
+            "rows": [asdict(item) for item in preview.periods],
+        }
+
+    def apply_academic_calendar_import(self, session: Session, group_code: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
+        if not rows:
+            raise ValueError("Нет периодов учебного процесса для сохранения.")
+        group = self._ensure_group(session, group_code)
+        semesters = sorted({int(row["semester"]) for row in rows})
+        existing = session.exec(
+            select(AcademicPeriod).where(
+                AcademicPeriod.group_id == group.id,
+                AcademicPeriod.semester.in_(semesters),
+            )
+        ).all()
+        for item in existing:
+            session.delete(item)
+        session.commit()
+
+        for row in rows:
+            session.add(
+                AcademicPeriod(
+                    group_id=group.id or 0,
+                    semester=int(row["semester"]),
+                    week_number=int(row["week_number"]),
+                    period_type=str(row["period_type"]),
+                    is_schedulable=bool(row["is_schedulable"]),
+                )
+            )
+        session.commit()
+        self.recalculate_group_loads(session, group.id or 0, semesters)
+        return {"group_code": group.code, "rows_saved": len(rows), "semesters": semesters}
+
+    def recalculate_group_loads(self, session: Session, group_id: int, semesters: list[int] | tuple[int, ...] = (3, 4)) -> None:
+        loads = session.exec(
+            select(CurriculumLoad).where(
+                CurriculumLoad.group_id == group_id,
+                CurriculumLoad.semester.in_(list(semesters)),
+            )
+        ).all()
+        for load in loads:
+            study_weeks = self._study_weeks(session, group_id, load.semester)
+            plan = build_weekly_load_plan(load.total_hours, study_weeks)
+            load.study_weeks = len(study_weeks)
+            load.hours_per_week = round(load.total_hours / max(len(study_weeks), 1), 2)
+            load.pairs_per_week = plan.target_pairs_per_week
+            details = self._load_details(load)
+            details.update(
+                {
+                    "total_pairs_needed": plan.total_pairs_needed,
+                    "base_pairs_per_week": plan.base_pairs_per_week,
+                    "target_pairs_per_week": plan.target_pairs_per_week,
+                    "remainder_pairs": plan.remainder_pairs,
+                    "remainder_hours": plan.remainder_hours,
+                    "extra_weeks": plan.extra_weeks,
+                    "uneven_distribution_strategy": plan.uneven_distribution_strategy,
+                }
+            )
+            load.details_json = json.dumps(details, ensure_ascii=False)
+            session.add(load)
+        session.commit()
+
+    def build_generation_setup(self, session: Session, semester: int, group_codes: list[str] | None = None) -> dict[str, Any]:
+        groups_query = select(Group)
+        if group_codes:
+            groups_query = groups_query.where(Group.code.in_(group_codes))
+        groups = session.exec(groups_query.order_by(Group.code)).all()
+
+        rows: list[dict[str, Any]] = []
+        summaries: list[dict[str, Any]] = []
+        warnings: list[str] = []
+        for group in groups:
+            loads = session.exec(
+                select(CurriculumLoad).where(
+                    CurriculumLoad.group_id == group.id,
+                    CurriculumLoad.semester == semester,
+                )
+            ).all()
+            study_weeks = self._study_weeks(session, group.id or 0, semester)
+            weekly_target_online = self.online_policy_service.get_target_for_group(session, group)
+            regular_capacity = len(study_weeks) * len(DAYS) * len(allowed_pairs_for_shift(group.shift))
+            online_capacity = len(study_weeks) * min(weekly_target_online, len(online_slot_numbers()))
+            total_pairs_needed = 0
+            group_warnings: list[str] = []
+
+            for load in loads:
+                subject = session.get(Subject, load.subject_id)
+                details = self._load_details(load)
+                plan = build_weekly_load_plan(load.total_hours, study_weeks)
+                teacher_options = session.exec(
+                    select(GroupSubjectTeacher).where(
+                        GroupSubjectTeacher.group_id == group.id,
+                        GroupSubjectTeacher.subject_id == load.subject_id,
+                    )
+                ).all()
+                total_pairs_needed += plan.total_pairs_needed
+                rows.append(
+                    {
+                        "group_code": group.code,
+                        "semester": semester,
+                        "module_code": details.get("module_code") or self._module_code_from_source(load.source_code),
+                        "module_name": subject.name if subject is not None else details.get("module_name") or str(load.subject_id),
+                        "control_form": details.get("control_form") or "не указано",
+                        "total_hours": load.total_hours,
+                        "raw_total_hours": load.raw_total_hours,
+                        "study_weeks_available": plan.study_weeks_available,
+                        "total_pairs_needed": plan.total_pairs_needed,
+                        "target_pairs_per_week": plan.target_pairs_per_week,
+                        "base_pairs_per_week": plan.base_pairs_per_week,
+                        "remainder_pairs": plan.remainder_pairs,
+                        "extra_weeks": ", ".join(str(item) for item in plan.extra_weeks) if plan.extra_weeks else "нет",
+                        "lesson_type": load.lesson_type,
+                        "teacher_assignment": "есть" if teacher_options else "нужен черновой преподаватель",
+                        "distribution": plan.uneven_distribution_strategy,
+                    }
+                )
+                if not teacher_options:
+                    group_warnings.append(f"Для модуля «{subject.name if subject else load.subject_id}» не найдено закрепление преподавателя.")
+            if not study_weeks:
+                group_warnings.append("Нет учебных недель для генерации по выбранному семестру.")
+            if total_pairs_needed > regular_capacity + online_capacity:
+                group_warnings.append(
+                    f"Теоретическая нагрузка {total_pairs_needed} пар превышает доступную ёмкость {regular_capacity + online_capacity} пар."
+                )
+            summaries.append(
+                {
+                    "group_code": group.code,
+                    "shift": group.shift,
+                    "study_weeks": len(study_weeks),
+                    "regular_capacity": regular_capacity,
+                    "online_capacity": online_capacity,
+                    "total_pairs_needed": total_pairs_needed,
+                    "warnings": group_warnings,
+                }
+            )
+            warnings.extend(f"{group.code}: {item}" for item in group_warnings)
+        return {"summaries": summaries, "rows": rows, "warnings": warnings}
 
     def update_entry(self, session: Session, entry_id: int, payload: dict) -> ScheduleEntry:
         entry = session.get(ScheduleEntry, entry_id)
@@ -142,6 +376,7 @@ class TimetableService:
                 entry.delivery_mode = DELIVERY_OFFLINE
         apply_timeslot_to_entry(entry)
         self._validate_slot_rules(group, entry)
+        self._validate_schedulable_weeks(session, entry)
         if entry.lesson_mode == LESSON_MODE_REGULAR and room_required(entry.delivery_mode) and entry.room_id is None and payload.get("room_id") is None:
             available_room = self._find_available_room(session, entry)
             entry.room_id = available_room.id if available_room else None
@@ -419,6 +654,167 @@ class TimetableService:
             if not room_busy:
                 return room
         return None
+
+    def _validate_schedulable_weeks(self, session: Session, entry: ScheduleEntry) -> None:
+        if entry.lesson_mode != LESSON_MODE_REGULAR:
+            return
+        weeks = list(self._weeks_from_scope(entry.week_scope))
+        if not weeks:
+            return
+        blocked = session.exec(
+            select(AcademicPeriod).where(
+                AcademicPeriod.group_id == entry.group_id,
+                AcademicPeriod.week_number.in_(weeks),
+                AcademicPeriod.is_schedulable.is_(False),
+            )
+        ).all()
+        if blocked:
+            weeks = ", ".join(str(item.week_number) for item in blocked)
+            raise ValueError(f"Занятие попадает на заблокированные недели: {weeks}.")
+
+    def _ensure_group(self, session: Session, group_code: str) -> Group:
+        group = session.exec(select(Group).where(Group.code == group_code)).first()
+        if group is not None:
+            return group
+        department = session.exec(select(Department).where(Department.code == "IT")).first()
+        if department is None:
+            department = Department(code="IT", name="Информационные технологии")
+            session.add(department)
+            session.commit()
+            session.refresh(department)
+        group = Group(
+            code=group_code,
+            name=group_code,
+            home_department_id=department.id or 0,
+            course=2,
+            year=2,
+            semester=4,
+            student_count=25,
+            shift=SHIFT_MORNING,
+        )
+        session.add(group)
+        session.commit()
+        session.refresh(group)
+        return group
+
+    @staticmethod
+    def _curriculum_row_to_dict(item) -> dict[str, Any]:
+        payload = asdict(item)
+        payload["module_code"] = item.module_code
+        payload["module_name"] = item.module_name
+        return payload
+
+    def _upsert_subject_from_curriculum_row(self, session: Session, group: Group, row: dict[str, Any]) -> Subject:
+        module_code = str(row.get("module_code") or self._module_code_from_source(str(row.get("subject_code") or "")))
+        subject_prefix = group.code.split("-", 1)[0]
+        subject_code = f"{subject_prefix}-{module_code.replace(' ', '').upper()}-S{int(row['semester'])}"
+        subject = session.exec(select(Subject).where(Subject.code == subject_code)).first()
+        if subject is None:
+            subject = Subject(
+                code=subject_code,
+                name=str(row.get("subject_name") or row.get("module_name") or module_code),
+                owner_department_id=group.home_department_id,
+                lesson_type=str(row.get("lesson_type") or "lecture"),
+                requires_special_room=bool(row.get("requires_special_room")),
+                can_be_online=bool(row.get("can_be_online")),
+                default_delivery_mode=str(row.get("default_delivery_mode") or DELIVERY_OFFLINE),
+            )
+        else:
+            subject.name = str(row.get("subject_name") or row.get("module_name") or subject.name)
+            subject.owner_department_id = group.home_department_id
+            subject.lesson_type = str(row.get("lesson_type") or subject.lesson_type)
+            subject.requires_special_room = bool(row.get("requires_special_room"))
+            subject.can_be_online = bool(row.get("can_be_online"))
+            subject.default_delivery_mode = str(row.get("default_delivery_mode") or subject.default_delivery_mode or DELIVERY_OFFLINE)
+        session.add(subject)
+        session.commit()
+        session.refresh(subject)
+        return subject
+
+    def _ensure_default_teacher_mapping(self, session: Session, group_id: int, subject_id: int, module_name: str) -> None:
+        current = session.exec(
+            select(GroupSubjectTeacher).where(
+                GroupSubjectTeacher.group_id == group_id,
+                GroupSubjectTeacher.subject_id == subject_id,
+            )
+        ).all()
+        if current:
+            return
+        teacher = self._pick_default_teacher(session, module_name)
+        if teacher is None:
+            return
+        teacher_subject = session.exec(
+            select(TeacherSubject).where(
+                TeacherSubject.teacher_id == teacher.id,
+                TeacherSubject.subject_id == subject_id,
+            )
+        ).first()
+        if teacher_subject is None:
+            teacher_subject = TeacherSubject(
+                teacher_id=teacher.id or 0,
+                subject_id=subject_id,
+                can_teach=True,
+                priority=50,
+            )
+        else:
+            teacher_subject.can_teach = True
+        session.add(teacher_subject)
+        session.add(
+            GroupSubjectTeacher(
+                group_id=group_id,
+                subject_id=subject_id,
+                teacher_id=teacher.id or 0,
+                fixed=True,
+            )
+        )
+        session.commit()
+
+    def _pick_default_teacher(self, session: Session, module_name: str) -> Teacher | None:
+        lowered = module_name.lower()
+        preferred_names = [
+            ("дене", "Aiman Abdullaeva"),
+            ("эконом", "Saule Tolegenova"),
+            ("мобиль", "Aliya Serik"),
+            ("бұлт", "Dana Kairatova"),
+            ("талдау", "Aidos Zhaparov"),
+            ("сайт", "Maksat Nurpeisov"),
+            ("web", "Maksat Nurpeisov"),
+        ]
+        for keyword, full_name in preferred_names:
+            if keyword in lowered:
+                teacher = session.exec(select(Teacher).where(Teacher.full_name == full_name)).first()
+                if teacher is not None:
+                    return teacher
+        return session.exec(select(Teacher).order_by(Teacher.full_name)).first()
+
+    def _study_weeks(self, session: Session, group_id: int, semester: int) -> list[int]:
+        periods = session.exec(
+            select(AcademicPeriod).where(
+                AcademicPeriod.group_id == group_id,
+                AcademicPeriod.semester == semester,
+                AcademicPeriod.is_schedulable.is_(True),
+            ).order_by(AcademicPeriod.week_number)
+        ).all()
+        return [period.week_number for period in periods]
+
+    @staticmethod
+    def _module_code_from_source(source_code: str) -> str:
+        return source_code.rsplit("-S", 1)[0] if source_code else ""
+
+    @staticmethod
+    def _weeks_from_scope(scope: str) -> set[int]:
+        from app.core.week_scope import decode_week_scope
+
+        return decode_week_scope(scope)
+
+    @staticmethod
+    def _load_details(load: CurriculumLoad) -> dict[str, Any]:
+        if not load.details_json:
+            return {}
+        try:
+            return json.loads(load.details_json)
+        except json.JSONDecodeError:
+            return {}
 
     @staticmethod
     def _setting(session: Session, key: str) -> str:

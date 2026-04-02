@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import json
 from typing import Any
 
 from fastapi import FastAPI
@@ -129,6 +130,13 @@ def session_scope() -> Session:
 
 def selection_options(rows: list, label_field: str = "code") -> dict[int, str]:
     return {row.id or 0: getattr(row, label_field) for row in rows}
+
+
+def preferred_group_id(rows: list[Group], preferred_code: str = "ETB-1124-1") -> int | None:
+    preferred = next((row for row in rows if row.code == preferred_code), None)
+    if preferred is not None:
+        return preferred.id
+    return rows[0].id if rows else None
 
 
 def shift_options(include_all: bool = False) -> dict[str, str]:
@@ -407,7 +415,97 @@ def calendar_page() -> None:
     with page_shell(tr("page.calendar")):
         with session_scope() as session:
             groups = session.exec(select(Group).order_by(Group.code)).all()
-        state = {"group_id": groups[0].id if groups else None, "semester": 3}
+        state = {
+            "group_id": preferred_group_id(groups),
+            "semester": 3,
+            "preview": None,
+            "preview_rows": [],
+            "preview_index": 0,
+        }
+
+        with ui.card().classes("panel-card w-full p-5 gap-3"):
+            ui.label("Импорт учебного процесса").classes("text-lg font-semibold")
+            calendar_path = ui.input("Путь к PDF учебного процесса", value=str(settings.calendar_source)).classes("w-full")
+            add_help(
+                calendar_path,
+                "Используйте PDF с учебным процессом. Для ETB-1124-1 доступен безопасный полуавтоматический разбор с возможностью ручной корректировки.",
+            )
+            with ui.row().classes("gap-3 w-full"):
+                ui.select(
+                    selection_options(groups),
+                    value=state["group_id"],
+                    label=tr("common.group"),
+                    on_change=lambda event: state.update({"group_id": event.value}),
+                ).classes("w-72")
+                ui.button("Предпросмотр данных", on_click=lambda: _load_calendar_preview()).props("color=amber-8")
+                ui.button("Сохранить импорт", on_click=lambda: _apply_calendar_preview()).props("outline color=dark")
+
+        @ui.refreshable
+        def render_calendar_preview() -> None:
+            preview = state["preview"]
+            rows = state["preview_rows"]
+            if not preview:
+                return
+            study_counts = {
+                3: sum(1 for item in rows if item["semester"] == 3 and item["is_schedulable"]),
+                4: sum(1 for item in rows if item["semester"] == 4 and item["is_schedulable"]),
+            }
+            blocked_counts = {
+                3: sum(1 for item in rows if item["semester"] == 3 and not item["is_schedulable"]),
+                4: sum(1 for item in rows if item["semester"] == 4 and not item["is_schedulable"]),
+            }
+            with ui.card().classes("panel-card w-full p-5 gap-3 mt-4"):
+                ui.label("Предпросмотр данных").classes("text-lg font-semibold")
+                ui.label(f"Файл: {preview['file_name']}").classes("text-sm")
+                ui.label(f"Группа: {preview['detected_group_code']}").classes("text-sm")
+                ui.label(f"Строка из PDF: {preview['row_excerpt']}").classes("text-xs text-[#6b7280] break-all")
+                with ui.row().classes("gap-3"):
+                    for semester in (3, 4):
+                        with ui.card().classes("panel-card p-4 min-w-[220px]"):
+                            ui.label(f"Семестр {semester}").classes("font-semibold")
+                            ui.label(f"Учебные недели: {study_counts[semester]}")
+                            ui.label(f"Заблокированные периоды: {blocked_counts[semester]}")
+                for warning in preview.get("warnings") or []:
+                    ui.label(warning).classes("text-sm text-[#b45309]")
+                ui.table(
+                    columns=[
+                        {"name": "semester", "label": tr("common.semester"), "field": "semester"},
+                        {"name": "week_number", "label": tr("common.week"), "field": "week_number"},
+                        {"name": "period_type", "label": "Тип периода", "field": "period_type"},
+                        {"name": "is_schedulable", "label": "Можно ставить пары", "field": "is_schedulable"},
+                    ],
+                    rows=[
+                        {
+                            **item,
+                            "period_type": tr(f"period.{item['period_type']}"),
+                            "is_schedulable": bool_label(bool(item["is_schedulable"])),
+                        }
+                        for item in rows
+                    ],
+                    row_key="week_number",
+                ).classes("w-full")
+                if rows:
+                    selector = ui.select(
+                        {
+                            index: f"Семестр {item['semester']}, неделя {item['week_number']}"
+                            for index, item in enumerate(rows)
+                        },
+                        value=min(state["preview_index"], len(rows) - 1),
+                        label="Строка для ручной корректировки",
+                    ).classes("w-full")
+                    selected = rows[min(state["preview_index"], len(rows) - 1)]
+                    period_type = ui.select(period_options(), value=selected["period_type"], label="Тип периода").classes("w-72")
+                    schedulable = ui.switch("Это учебная неделя", value=bool(selected["is_schedulable"]))
+
+                    def _apply_preview_edit() -> None:
+                        index = int(selector.value or 0)
+                        state["preview_index"] = index
+                        state["preview_rows"][index]["period_type"] = period_type.value
+                        state["preview_rows"][index]["is_schedulable"] = bool(schedulable.value)
+                        render_calendar_preview.refresh()
+
+                    selector.on_value_change(lambda event: (state.update({"preview_index": int(event.value or 0)}), render_calendar_preview.refresh()))
+                    ui.button("Применить изменение к строке", on_click=_apply_preview_edit).props("outline color=dark")
 
         @ui.refreshable
         def render_periods() -> None:
@@ -418,17 +516,22 @@ def calendar_page() -> None:
                         AcademicPeriod.semester == state["semester"],
                     ).order_by(AcademicPeriod.week_number)
                 ).all()
-            for period in periods:
-                with ui.row().classes("panel-card w-full items-center p-3 gap-3"):
-                    ui.label(f"{tr('common.week')} {period.week_number}").classes("w-24 font-semibold")
-                    period_select = ui.select(period_options(), value=period.period_type, label=tr("calendar.period_type")).classes("w-80")
-                    schedulable = ui.switch(tr("calendar.schedulable"), value=period.is_schedulable)
-                    ui.button(
-                        tr("common.save"),
-                        on_click=lambda p=period, ps=period_select, sc=schedulable: _save_period(p.id or 0, ps.value, bool(sc.value)),
-                    ).props("outline color=dark")
+            with ui.card().classes("panel-card w-full p-5 gap-3 mt-4"):
+                ui.label("Учебные недели и заблокированные периоды").classes("text-lg font-semibold")
+                if not periods:
+                    ui.label("Данные учебного процесса пока не загружены.").classes("text-sm text-[#6b7280]")
+                    return
+                for period in periods:
+                    with ui.row().classes("w-full items-center p-3 gap-3 border-b border-[#eadfbe]"):
+                        ui.label(f"{tr('common.week')} {period.week_number}").classes("w-24 font-semibold")
+                        period_select = ui.select(period_options(), value=period.period_type, label="Тип периода").classes("w-80")
+                        schedulable = ui.switch("Можно ставить пары", value=period.is_schedulable)
+                        ui.button(
+                            tr("common.save"),
+                            on_click=lambda p=period, ps=period_select, sc=schedulable: _save_period(p.id or 0, ps.value, bool(sc.value)),
+                        ).props("outline color=dark")
 
-        with ui.row().classes("gap-3"):
+        with ui.row().classes("gap-3 mt-4"):
             ui.select(
                 selection_options(groups),
                 value=state["group_id"],
@@ -441,16 +544,56 @@ def calendar_page() -> None:
                 label=tr("common.semester"),
                 on_change=lambda event: (state.update({"semester": event.value}), render_periods.refresh()),
             )
+        render_calendar_preview()
         render_periods()
 
         def _save_period(period_id: int, period_type: str, schedulable: bool) -> None:
             with session_scope() as session:
                 period = session.get(AcademicPeriod, period_id)
+                if period is None:
+                    ui.notify("Период не найден.", color="negative")
+                    return
                 period.period_type = period_type
                 period.is_schedulable = schedulable
                 session.add(period)
                 session.commit()
+                service.recalculate_group_loads(session, period.group_id, [period.semester])
             ui.notify(tr("calendar.period_updated"), color="positive")
+            render_periods.refresh()
+
+        def _load_calendar_preview() -> None:
+            selected_group = next((item for item in groups if item.id == state["group_id"]), None)
+            if selected_group is None:
+                ui.notify("Выберите группу для импорта учебного процесса.", color="negative")
+                return
+            try:
+                preview = service.preview_academic_calendar_import(calendar_path.value, selected_group.code)
+            except ValueError as exc:
+                ui.notify(str(exc), color="negative", multi_line=True)
+                return
+            state["preview"] = preview
+            state["preview_rows"] = list(preview["rows"])
+            state["preview_index"] = 0
+            render_calendar_preview.refresh()
+
+        def _apply_calendar_preview() -> None:
+            selected_group = next((item for item in groups if item.id == state["group_id"]), None)
+            if selected_group is None:
+                ui.notify("Выберите группу для сохранения учебного процесса.", color="negative")
+                return
+            if not state["preview_rows"]:
+                ui.notify("Сначала загрузите предпросмотр PDF.", color="negative")
+                return
+            with session_scope() as session:
+                try:
+                    result = service.apply_academic_calendar_import(session, selected_group.code, state["preview_rows"])
+                except ValueError as exc:
+                    ui.notify(str(exc), color="negative", multi_line=True)
+                    return
+            ui.notify(
+                f"Импорт учебного процесса сохранён: {result['rows_saved']} строк для {result['group_code']}.",
+                color="positive",
+            )
             render_periods.refresh()
 
 
@@ -459,7 +602,106 @@ def curriculum_page() -> None:
     with page_shell(tr("page.curriculum")):
         with session_scope() as session:
             groups = session.exec(select(Group).order_by(Group.code)).all()
-        state = {"group_id": groups[0].id if groups else None, "semester": 3}
+        state = {
+            "group_id": preferred_group_id(groups),
+            "semester": 3,
+            "preview": None,
+            "preview_rows": [],
+            "preview_index": 0,
+        }
+
+        with ui.card().classes("panel-card w-full p-5 gap-3"):
+            ui.label("Импорт учебного плана").classes("text-lg font-semibold")
+            curriculum_path = ui.input("Путь к XLS учебного плана", value=str(settings.curriculum_source)).classes("w-full")
+            add_help(
+                curriculum_path,
+                "Для расписания используются строки БМ/КМ. Если разбор неидеален, отредактируйте строки перед сохранением.",
+            )
+            with ui.row().classes("gap-3 w-full"):
+                ui.select(
+                    selection_options(groups),
+                    value=state["group_id"],
+                    label=tr("common.group"),
+                    on_change=lambda event: state.update({"group_id": event.value}),
+                ).classes("w-72")
+                ui.button("Предпросмотр данных", on_click=lambda: _load_curriculum_preview()).props("color=amber-8")
+                ui.button("Сохранить импорт", on_click=lambda: _apply_curriculum_preview()).props("outline color=dark")
+
+        @ui.refreshable
+        def render_curriculum_preview() -> None:
+            preview = state["preview"]
+            rows = state["preview_rows"]
+            if not preview:
+                return
+            with ui.card().classes("panel-card w-full p-5 gap-3 mt-4"):
+                ui.label("Предпросмотр данных").classes("text-lg font-semibold")
+                ui.label(f"Файл: {preview['file_name']}").classes("text-sm")
+                ui.label(f"Определённая группа: {preview['detected_group_code']}").classes("text-sm")
+                ui.label(f"Лист: {preview['sheet_name']}").classes("text-sm")
+                if preview.get("detected_specialty"):
+                    ui.label(preview["detected_specialty"]).classes("text-sm")
+                if preview.get("detected_qualification"):
+                    ui.label(preview["detected_qualification"]).classes("text-sm")
+                with ui.row().classes("gap-3"):
+                    for semester in (3, 4):
+                        totals = preview["semester_totals"].get(semester, {})
+                        with ui.card().classes("panel-card p-4 min-w-[220px]"):
+                            ui.label(f"Семестр {semester}").classes("font-semibold")
+                            ui.label(f"Всего часов: {totals.get('raw_hours', 0)}")
+                            ui.label(f"Часов для расписания: {totals.get('schedulable_hours', 0)}")
+                for warning in preview.get("warnings") or []:
+                    ui.label(warning).classes("text-sm text-[#b45309]")
+                ui.table(
+                    columns=[
+                        {"name": "semester", "label": tr("common.semester"), "field": "semester"},
+                        {"name": "module_code", "label": tr("common.code"), "field": "module_code"},
+                        {"name": "module_name", "label": "Нагрузка по модулям", "field": "module_name"},
+                        {"name": "raw_total_hours", "label": tr("curriculum.raw_hours"), "field": "raw_total_hours"},
+                        {"name": "schedulable_hours", "label": tr("curriculum.schedulable_hours"), "field": "schedulable_hours"},
+                        {"name": "theory_hours", "label": "Теория", "field": "theory_hours"},
+                        {"name": "lab_hours", "label": "Лаб./практ.", "field": "lab_hours"},
+                        {"name": "practice_hours", "label": tr("curriculum.practice_hours"), "field": "practice_hours"},
+                        {"name": "control_form", "label": "Форма контроля", "field": "control_form"},
+                    ],
+                    rows=rows,
+                    row_key="subject_code",
+                ).classes("w-full")
+                if rows:
+                    selector = ui.select(
+                        {
+                            index: f"{item['module_code']} / семестр {item['semester']}"
+                            for index, item in enumerate(rows)
+                        },
+                        value=min(state["preview_index"], len(rows) - 1),
+                        label="Строка для ручной корректировки",
+                    ).classes("w-full")
+                    selected = rows[min(state["preview_index"], len(rows) - 1)]
+                    module_name = ui.input("Модуль / предмет", value=selected["module_name"]).classes("w-full")
+                    semester_widget = ui.select({3: "Семестр 3", 4: "Семестр 4"}, value=selected["semester"], label=tr("common.semester")).classes("w-48")
+                    raw_hours = ui.number("Всего часов", value=selected["raw_total_hours"], min=0, step=2).classes("w-40")
+                    schedulable_hours = ui.number("Часов для расписания", value=selected["schedulable_hours"], min=0, step=2).classes("w-52")
+                    theory_hours = ui.number("Теория", value=selected["theory_hours"], min=0, step=2).classes("w-32")
+                    lab_hours = ui.number("Лаб./практ.", value=selected["lab_hours"], min=0, step=2).classes("w-40")
+                    practice_hours = ui.number("Практика", value=selected["practice_hours"], min=0, step=2).classes("w-36")
+                    control_form = ui.input("Форма контроля", value=selected["control_form"]).classes("w-full")
+
+                    def _apply_curriculum_edit() -> None:
+                        index = int(selector.value or 0)
+                        state["preview_index"] = index
+                        row = state["preview_rows"][index]
+                        row["module_name"] = module_name.value
+                        row["subject_name"] = module_name.value
+                        row["semester"] = int(semester_widget.value)
+                        row["raw_total_hours"] = int(raw_hours.value or 0)
+                        row["schedulable_hours"] = int(schedulable_hours.value or 0)
+                        row["theory_hours"] = int(theory_hours.value or 0)
+                        row["lab_hours"] = int(lab_hours.value or 0)
+                        row["practice_hours"] = int(practice_hours.value or 0)
+                        row["control_form"] = control_form.value
+                        render_curriculum_preview.refresh()
+
+                    selector.on_value_change(lambda event: (state.update({"preview_index": int(event.value or 0)}), render_curriculum_preview.refresh()))
+                    ui.button("Применить изменение к строке", on_click=_apply_curriculum_edit).props("outline color=dark")
 
         @ui.refreshable
         def render_loads() -> None:
@@ -471,37 +713,46 @@ def curriculum_page() -> None:
                     )
                 ).all()
                 subjects = {subject.id: subject.name for subject in session.exec(select(Subject)).all()}
-            rows = [
-                {
-                    "subject": subjects[load.subject_id],
-                    "total_hours": load.total_hours,
-                    "raw_total_hours": load.raw_total_hours,
-                    "practice_hours": load.practice_hours,
-                    "study_weeks": load.study_weeks,
-                    "hours_per_week": load.hours_per_week,
-                    "pairs_per_week": load.pairs_per_week,
-                    "lesson_type": load.lesson_type,
-                    "delivery_mode": delivery_mode_label(load.delivery_mode, lang=LANG),
-                }
-                for load in loads
-            ]
-            ui.table(
-                columns=[
-                    {"name": "subject", "label": tr("common.subject"), "field": "subject"},
-                    {"name": "total_hours", "label": tr("curriculum.schedulable_hours"), "field": "total_hours"},
-                    {"name": "raw_total_hours", "label": tr("curriculum.raw_hours"), "field": "raw_total_hours"},
-                    {"name": "practice_hours", "label": tr("curriculum.practice_hours"), "field": "practice_hours"},
-                    {"name": "study_weeks", "label": tr("curriculum.study_weeks"), "field": "study_weeks"},
-                    {"name": "hours_per_week", "label": tr("curriculum.hours_per_week"), "field": "hours_per_week"},
-                    {"name": "pairs_per_week", "label": tr("curriculum.pairs_per_week"), "field": "pairs_per_week"},
-                    {"name": "lesson_type", "label": tr("subjects.lesson_type"), "field": "lesson_type"},
-                    {"name": "delivery_mode", "label": tr("common.delivery_mode"), "field": "delivery_mode"},
-                ],
-                rows=rows,
-                row_key="subject",
-            ).classes("panel-card w-full")
+            rows = []
+            for load in loads:
+                details = json.loads(load.details_json or "{}") if load.details_json else {}
+                rows.append(
+                    {
+                        "subject": subjects.get(load.subject_id, str(load.subject_id)),
+                        "module_code": details.get("module_code") or load.source_code,
+                        "total_hours": load.total_hours,
+                        "raw_total_hours": load.raw_total_hours,
+                        "practice_hours": load.practice_hours,
+                        "study_weeks": load.study_weeks,
+                        "hours_per_week": load.hours_per_week,
+                        "pairs_per_week": load.pairs_per_week,
+                        "total_pairs_needed": details.get("total_pairs_needed", "-"),
+                        "remainder_pairs": details.get("remainder_pairs", "-"),
+                        "control_form": details.get("control_form", "не указано"),
+                        "lesson_type": load.lesson_type,
+                        "delivery_mode": delivery_mode_label(load.delivery_mode, lang=LANG),
+                    }
+                )
+            with ui.card().classes("panel-card w-full p-5 gap-3 mt-4"):
+                ui.label("Расчёт пар в неделю").classes("text-lg font-semibold")
+                ui.table(
+                    columns=[
+                        {"name": "subject", "label": tr("common.subject"), "field": "subject"},
+                        {"name": "module_code", "label": tr("common.code"), "field": "module_code"},
+                        {"name": "total_hours", "label": tr("curriculum.schedulable_hours"), "field": "total_hours"},
+                        {"name": "raw_total_hours", "label": tr("curriculum.raw_hours"), "field": "raw_total_hours"},
+                        {"name": "practice_hours", "label": tr("curriculum.practice_hours"), "field": "practice_hours"},
+                        {"name": "study_weeks", "label": tr("curriculum.study_weeks"), "field": "study_weeks"},
+                        {"name": "pairs_per_week", "label": tr("curriculum.pairs_per_week"), "field": "pairs_per_week"},
+                        {"name": "total_pairs_needed", "label": "Всего пар", "field": "total_pairs_needed"},
+                        {"name": "remainder_pairs", "label": "Остаток пар", "field": "remainder_pairs"},
+                        {"name": "control_form", "label": "Форма контроля", "field": "control_form"},
+                    ],
+                    rows=rows,
+                    row_key="subject",
+                ).classes("w-full")
 
-        with ui.row().classes("gap-3"):
+        with ui.row().classes("gap-3 mt-4"):
             ui.select(
                 selection_options(groups),
                 value=state["group_id"],
@@ -514,7 +765,43 @@ def curriculum_page() -> None:
                 label=tr("common.semester"),
                 on_change=lambda event: (state.update({"semester": event.value}), render_loads.refresh()),
             )
+        render_curriculum_preview()
         render_loads()
+
+        def _load_curriculum_preview() -> None:
+            selected_group = next((item for item in groups if item.id == state["group_id"]), None)
+            if selected_group is None:
+                ui.notify("Выберите группу для импорта учебного плана.", color="negative")
+                return
+            try:
+                preview = service.preview_curriculum_import(curriculum_path.value, selected_group.code)
+            except ValueError as exc:
+                ui.notify(str(exc), color="negative", multi_line=True)
+                return
+            state["preview"] = preview
+            state["preview_rows"] = list(preview["rows"])
+            state["preview_index"] = 0
+            render_curriculum_preview.refresh()
+
+        def _apply_curriculum_preview() -> None:
+            selected_group = next((item for item in groups if item.id == state["group_id"]), None)
+            if selected_group is None:
+                ui.notify("Выберите группу для сохранения учебного плана.", color="negative")
+                return
+            if not state["preview_rows"]:
+                ui.notify("Сначала загрузите предпросмотр XLS.", color="negative")
+                return
+            with session_scope() as session:
+                try:
+                    result = service.apply_curriculum_import(session, selected_group.code, state["preview_rows"])
+                except ValueError as exc:
+                    ui.notify(str(exc), color="negative", multi_line=True)
+                    return
+            ui.notify(
+                f"Импорт учебного плана сохранён: {result['rows_saved']} строк для {result['group_code']}.",
+                color="positive",
+            )
+            render_loads.refresh()
 
 
 @ui.page("/generator")
@@ -523,13 +810,61 @@ def generator_page() -> None:
         with session_scope() as session:
             groups = session.exec(select(Group).order_by(Group.code)).all()
             schedules = session.exec(select(Schedule).order_by(Schedule.created_at.desc())).all()
+        preferred_id = preferred_group_id(groups)
         semester = ui.select({3: f"{tr('common.semester')} 3", 4: f"{tr('common.semester')} 4"}, value=3, label=tr("common.semester")).classes("w-56")
-        selected_groups = ui.select(selection_options(groups), multiple=True, label=tr("nav.groups")).classes("w-full")
-        schedule_name = ui.input(tr("generator.schedule_name"), value=f"{tr('common.schedule')} {tr('common.semester')} 3").classes("w-full")
+        selected_groups = ui.select(
+            selection_options(groups),
+            multiple=True,
+            value=[preferred_id] if preferred_id else [],
+            label=tr("nav.groups"),
+        ).classes("w-full")
+        schedule_name = ui.input(tr("generator.schedule_name"), value="Расписание ETB-1124-1 семестр 3").classes("w-full")
         ui.button(
-            tr("generator.generate"),
+            "Запустить генерацию",
             on_click=lambda: _generate_schedule(int(semester.value), list(selected_groups.value or []), schedule_name.value),
         ).props("color=amber-8")
+        add_help(schedule_name, "Генерация использует только учебные недели и отдельно считает дополнительные онлайн-слоты.")
+
+        @ui.refreshable
+        def render_generation_setup() -> None:
+            group_ids = list(selected_groups.value or [])
+            if not group_ids:
+                ui.label("Выберите хотя бы одну группу для расчёта генерации.").classes("text-sm text-[#6b7280]")
+                return
+            with session_scope() as session:
+                target_codes = [session.get(Group, group_id).code for group_id in group_ids if session.get(Group, group_id)]
+                preview = service.build_generation_setup(session, int(semester.value), target_codes)
+            with ui.card().classes("panel-card w-full p-5 gap-3 mt-4"):
+                ui.label("Предпросмотр данных").classes("text-lg font-semibold")
+                for warning in preview["warnings"]:
+                    ui.label(warning).classes("text-sm text-[#b45309]")
+                with ui.row().classes("gap-3"):
+                    for summary in preview["summaries"]:
+                        with ui.card().classes("panel-card p-4 min-w-[260px]"):
+                            ui.label(summary["group_code"]).classes("font-semibold")
+                            ui.label(f"Учебные недели: {summary['study_weeks']}")
+                            ui.label(f"Регулярная ёмкость: {summary['regular_capacity']} пар")
+                            ui.label(f"Онлайн-ёмкость: {summary['online_capacity']} пар")
+                            ui.label(f"Требуется: {summary['total_pairs_needed']} пар")
+                ui.table(
+                    columns=[
+                        {"name": "group_code", "label": tr("common.group"), "field": "group_code"},
+                        {"name": "module_code", "label": tr("common.code"), "field": "module_code"},
+                        {"name": "module_name", "label": "Нагрузка по модулям", "field": "module_name"},
+                        {"name": "total_hours", "label": tr("curriculum.schedulable_hours"), "field": "total_hours"},
+                        {"name": "study_weeks_available", "label": tr("curriculum.study_weeks"), "field": "study_weeks_available"},
+                        {"name": "total_pairs_needed", "label": "Всего пар", "field": "total_pairs_needed"},
+                        {"name": "target_pairs_per_week", "label": "Цель пар в неделю", "field": "target_pairs_per_week"},
+                        {"name": "remainder_pairs", "label": "Остаток пар", "field": "remainder_pairs"},
+                        {"name": "teacher_assignment", "label": "Преподаватель", "field": "teacher_assignment"},
+                    ],
+                    rows=preview["rows"],
+                    row_key="module_name",
+                ).classes("w-full")
+
+        semester.on_value_change(lambda _: render_generation_setup.refresh())
+        selected_groups.on_value_change(lambda _: render_generation_setup.refresh())
+        render_generation_setup()
         ui.separator()
         ui.label(tr("generator.existing")).classes("text-lg font-semibold")
         ui.table(
@@ -543,6 +878,9 @@ def generator_page() -> None:
         ).classes("panel-card w-full")
 
         def _generate_schedule(selected_semester: int, group_ids: list[int], name: str) -> None:
+            if not group_ids:
+                ui.notify("Выберите группу для генерации расписания.", color="negative")
+                return
             with session_scope() as session:
                 target_codes = [session.get(Group, group_id).code for group_id in group_ids] if group_ids else None
                 schedule = service.generate_schedule(

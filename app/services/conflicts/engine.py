@@ -6,6 +6,7 @@ from collections import defaultdict
 from sqlmodel import Session, delete, select
 
 from app.core.constants import HARD_CONFLICTS
+from app.core.load_planning import academic_hours_to_pairs
 from app.core.timetable import (
     DAYS,
     DELIVERY_ONLINE,
@@ -255,7 +256,7 @@ class ConflictEngine:
         entries: list[ScheduleEntry],
     ) -> list[Conflict]:
         loads = session.exec(select(CurriculumLoad).where(CurriculumLoad.semester == schedule.semester)).all()
-        target_group_ids = {entry.group_id for entry in entries}
+        target_group_ids = self._target_group_ids(schedule, entries)
         relevant_loads = [load for load in loads if load.group_id in target_group_ids]
         grouped_entries: dict[tuple[int, int], list[ScheduleEntry]] = defaultdict(list)
         subjects = {subject.id: subject for subject in session.exec(select(Subject)).all()}
@@ -274,7 +275,7 @@ class ConflictEngine:
         }
         expected_pairs_by_group: dict[int, int] = defaultdict(int)
         for load in relevant_loads:
-            expected_pairs_by_group[load.group_id] += max(int(round(load.total_hours / 2)), 1)
+            expected_pairs_by_group[load.group_id] += max(academic_hours_to_pairs(load.total_hours), 1)
         conflicts: list[Conflict] = []
         for entry in entries:
             grouped_entries[(entry.group_id, entry.subject_id)].append(entry)
@@ -283,7 +284,7 @@ class ConflictEngine:
                 len(decode_week_scope(entry.week_scope))
                 for entry in grouped_entries.get((load.group_id, load.subject_id), [])
             )
-            expected_pairs = max(int(round(load.total_hours / 2)), 1)
+            expected_pairs = max(academic_hours_to_pairs(load.total_hours), 1)
             if scheduled_pairs >= expected_pairs:
                 continue
             missing_pairs = expected_pairs - scheduled_pairs
@@ -348,6 +349,18 @@ class ConflictEngine:
                 )
             )
         return conflicts
+
+    @staticmethod
+    def _target_group_ids(schedule: Schedule, entries: list[ScheduleEntry]) -> set[int]:
+        if schedule.details_json:
+            try:
+                payload = json.loads(schedule.details_json)
+            except json.JSONDecodeError:
+                payload = {}
+            group_ids = payload.get("group_ids") or []
+            if group_ids:
+                return {int(group_id) for group_id in group_ids}
+        return {entry.group_id for entry in entries}
 
     def _detect_online_rules(
         self,
