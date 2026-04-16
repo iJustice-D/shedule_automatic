@@ -19,6 +19,8 @@ class XlsxExporter:
             self._build_sheet(workbook, title[:31], grid, context, context["group_online_rows"].get(title, []))
         for title, grid in context["teacher_grids"].items():
             self._build_sheet(workbook, f"П-{title}"[:31], grid, context, context["teacher_online_rows"].get(title, []))
+        self._build_balance_sheet(workbook, context)
+        self._build_unresolved_sheet(workbook, context)
         workbook.save(output_path)
         return output_path
 
@@ -68,3 +70,44 @@ class XlsxExporter:
         sheet.freeze_panes = "B3"
         for column in "ABCDEFG":
             sheet.column_dimensions[column].width = 26
+
+    @staticmethod
+    def _build_balance_sheet(workbook: Workbook, context: dict) -> None:
+        sheet = workbook.create_sheet("Баланс нагрузки")
+        header_fill = PatternFill("solid", fgColor="E6B800")
+        rows = context.get("teacher_balance_rows", [])
+        headers = ["Преподаватель", "Семестр 3", "Семестр 4", "Отклонение", "На уточнении"]
+        for column, label in enumerate(headers, start=1):
+            cell = sheet.cell(1, column, label)
+            cell.fill = header_fill
+            cell.font = Font(bold=True)
+        if not rows:
+            sheet.cell(2, 1, "Данные отсутствуют")
+            return
+        for row_index, row in enumerate(rows, start=2):
+            sheet.cell(row_index, 1, row.get("teacher_name", ""))
+            sheet.cell(row_index, 2, row.get("semester_3_pairs", ""))
+            sheet.cell(row_index, 3, row.get("semester_4_pairs", ""))
+            sheet.cell(row_index, 4, row.get("normalized_balance_score", ""))
+            sheet.cell(row_index, 5, row.get("pending_rows", ""))
+
+    @staticmethod
+    def _build_unresolved_sheet(workbook: Workbook, context: dict) -> None:
+        sheet = workbook.create_sheet("Вакансии")
+        header_fill = PatternFill("solid", fgColor="E6B800")
+        rows = context.get("unresolved_weekly_rows_report", [])
+        headers = ["Группа", "Семестр", "Предмет", "Подгруппа", "Состояние", "Преподаватели из источника"]
+        for column, label in enumerate(headers, start=1):
+            cell = sheet.cell(1, column, label)
+            cell.fill = header_fill
+            cell.font = Font(bold=True)
+        if not rows:
+            sheet.cell(2, 1, "Неразрешённых строк нет")
+            return
+        for row_index, row in enumerate(rows, start=2):
+            sheet.cell(row_index, 1, row.get("group", ""))
+            sheet.cell(row_index, 2, row.get("semester", ""))
+            sheet.cell(row_index, 3, row.get("subject", ""))
+            sheet.cell(row_index, 4, row.get("subgroup", ""))
+            sheet.cell(row_index, 5, row.get("assignment_state", ""))
+            sheet.cell(row_index, 6, row.get("teacher_names", ""))

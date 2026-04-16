@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections import Counter
+import math
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 
 from sqlmodel import Session, select
@@ -11,18 +12,31 @@ from app.core.timetable import (
     DELIVERY_ONLINE,
     LESSON_MODE_ONLINE,
     LESSON_MODE_REGULAR,
-    ONLINE_ALLOWED_DAYS,
     SLOT_CATEGORY_ONLINE_EXTRA,
     SLOT_CATEGORY_REGULAR,
     allowed_pairs_for_shift,
     apply_timeslot_to_entry,
-    online_slot_day,
-    online_slot_numbers,
+    intervals_overlap,
+    pair_end,
+    pair_start,
     room_required,
 )
-from app.core.week_scope import encode_week_scope, scopes_overlap, spread_weeks
-from app.models import AcademicPeriod, CurriculumLoad, Group, GroupSubjectTeacher, Room, Schedule, ScheduleEntry, Subject, TeacherSubject
+from app.core.week_scope import decode_week_scope, encode_week_scope, scopes_overlap, spread_weeks
+from app.models import (
+    AcademicPeriod,
+    CurriculumLoad,
+    Group,
+    GroupSubjectTeacher,
+    OnlineSlot,
+    Room,
+    Schedule,
+    ScheduleEntry,
+    Subject,
+    TeacherSubject,
+    WeeklyLoad,
+)
 from app.services.online_policy import OnlinePolicyService
+from app.services.online_slots import OnlineSlotService
 
 
 @dataclass(slots=True)
@@ -33,17 +47,23 @@ class SessionDemand:
     room_candidates: list[int | None]
     week_scope: str
     shift: str
+    subgroup_code: str | None = None
     delivery_mode: str = DELIVERY_OFFLINE
     lesson_mode: str = LESSON_MODE_REGULAR
     slot_category: str = SLOT_CATEGORY_REGULAR
     online_allowed: bool = False
     locked: bool = False
-    metadata: dict[str, int | str] = field(default_factory=dict)
+    metadata: dict[str, int | float | str | bool] = field(default_factory=dict)
 
 
-class GreedyScheduleGenerator:
+class HybridScheduleGenerator:
     def __init__(self) -> None:
         self.online_policy_service = OnlinePolicyService()
+        self.online_slot_service = OnlineSlotService()
+        self._online_slot_map: dict[int, OnlineSlot] = {}
+        self._semester: int = 0
+        self._teacher_base_weekly_loads: dict[int, dict[int, float]] = defaultdict(lambda: defaultdict(float))
+        self._semester_week_counts: dict[int, int] = {3: 16, 4: 16}
 
     def generate(
         self,
@@ -56,25 +76,21 @@ class GreedyScheduleGenerator:
         if group_codes:
             groups_query = groups_query.where(Group.code.in_(group_codes))
         groups = session.exec(groups_query.order_by(Group.code)).all()
-        schedule = Schedule(name=schedule_name or f"Расписание семестра {semester}", semester=semester)
+        schedule = Schedule(
+            name=schedule_name or f"Расписание семестра {semester}",
+            semester=semester,
+            group_scope=",".join(group.code for group in groups),
+        )
         session.add(schedule)
         session.commit()
         session.refresh(schedule)
 
-        demands: list[SessionDemand] = []
-        for group in groups:
-            study_weeks = self._get_study_weeks(session, group.id or 0, semester)
-            if not study_weeks:
-                continue
-            loads = session.exec(
-                select(CurriculumLoad).where(
-                    CurriculumLoad.group_id == group.id,
-                    CurriculumLoad.semester == semester,
-                )
-            ).all()
-            for load in loads:
-                demands.extend(self._build_demands(session, group, load, study_weeks))
+        self._semester = semester
+        self._online_slot_map = {slot.id or 0: slot for slot in self.online_slot_service.active_slots(session)}
+        self._teacher_base_weekly_loads = self._teacher_semester_weekly_loads(session)
+        self._semester_week_counts = self._semester_study_week_counts(session)
 
+        demands = self._collect_demands(session, semester, groups)
         self._apply_online_targets(session, groups, demands)
         teacher_pressure = self._teacher_pressure(demands)
         regular_demands = sorted(
@@ -87,33 +103,78 @@ class GreedyScheduleGenerator:
         )
 
         entries: list[ScheduleEntry] = []
-        unscheduled_regular = self._place_phase(entries, regular_demands, schedule.id or 0)
-        self._repair_phase(entries, unscheduled_regular, schedule.id or 0)
-        unscheduled_online = self._place_phase(entries, online_demands, schedule.id or 0)
-        self._repair_phase(entries, unscheduled_online, schedule.id or 0)
+        unscheduled_regular = self._place_phase(session, entries, regular_demands, schedule.id or 0)
+        self._repair_phase(session, entries, unscheduled_regular, schedule.id or 0)
+        unscheduled_online = self._place_phase(session, entries, online_demands, schedule.id or 0)
+        self._repair_phase(session, entries, unscheduled_online, schedule.id or 0)
 
         for entry in entries:
             session.add(entry)
         session.commit()
         return schedule
 
+    def _collect_demands(self, session: Session, semester: int, groups: list[Group]) -> list[SessionDemand]:
+        group_ids = [group.id or 0 for group in groups]
+        weekly_rows = session.exec(
+            select(WeeklyLoad).where(
+                WeeklyLoad.is_active.is_(True),
+                WeeklyLoad.semester == semester,
+                WeeklyLoad.group_id.in_(group_ids),
+            )
+        ).all()
+        weekly_by_group: dict[int, list[WeeklyLoad]] = defaultdict(list)
+        for row in weekly_rows:
+            weekly_by_group[row.group_id].append(row)
+
+        manual_curriculum = session.exec(
+            select(CurriculumLoad).where(
+                CurriculumLoad.semester == semester,
+                CurriculumLoad.group_id.in_(group_ids),
+            )
+        ).all()
+        curriculum_by_group: dict[int, list[CurriculumLoad]] = defaultdict(list)
+        for row in manual_curriculum:
+            curriculum_by_group[row.group_id].append(row)
+
+        demands: list[SessionDemand] = []
+        for group in groups:
+            study_weeks = self._get_study_weeks(session, group.id or 0, semester)
+            if not study_weeks:
+                continue
+            primary_weekly = [
+                row
+                for row in weekly_by_group.get(group.id or 0, [])
+                if row.load_category == "regular" and not row.is_practice and not row.is_facultative
+            ]
+            for row in primary_weekly:
+                demands.extend(self._build_weekly_demands(session, group, row, study_weeks))
+
+            legacy_rows = curriculum_by_group.get(group.id or 0, [])
+            if primary_weekly:
+                legacy_rows = [row for row in legacy_rows if row.source_type == "manual"]
+            for row in legacy_rows:
+                demands.extend(self._build_curriculum_demands(session, group, row, study_weeks))
+        return demands
+
     def _place_phase(
         self,
+        session: Session,
         entries: list[ScheduleEntry],
         demands: list[SessionDemand],
         schedule_id: int,
     ) -> list[SessionDemand]:
         unscheduled: list[SessionDemand] = []
         for demand in demands:
-            placement = self._find_best_slot(entries, demand)
+            placement = self._find_best_slot(session, entries, demand)
             if placement is None:
                 unscheduled.append(demand)
                 continue
-            entries.append(self._make_entry(schedule_id, demand, placement))
+            entries.append(self._make_entry(session, schedule_id, demand, placement))
         return unscheduled
 
     def _repair_phase(
         self,
+        session: Session,
         entries: list[ScheduleEntry],
         unscheduled: list[SessionDemand],
         schedule_id: int,
@@ -121,15 +182,77 @@ class GreedyScheduleGenerator:
         pending = list(unscheduled)
         unscheduled.clear()
         for demand in pending:
-            placement = self._find_best_slot(entries, demand)
+            placement = self._find_best_slot(session, entries, demand)
             if placement is not None:
-                entries.append(self._make_entry(schedule_id, demand, placement))
+                entries.append(self._make_entry(session, schedule_id, demand, placement))
                 continue
-            if self._repair_single_blocker(entries, demand, schedule_id):
+            if self._repair_single_blocker(session, entries, demand, schedule_id):
                 continue
             unscheduled.append(demand)
 
-    def _build_demands(
+    def _build_weekly_demands(
+        self,
+        session: Session,
+        group: Group,
+        row: WeeklyLoad,
+        study_weeks: list[int],
+    ) -> list[SessionDemand]:
+        subject = session.get(Subject, row.subject_id)
+        online_allowed = self.online_policy_service.is_subject_allowed_online(session, group, subject) if subject else False
+        teacher_candidates = self._teacher_candidates_for_weekly(session, row)
+        room_candidates = self._room_candidates(session, row.subject_id)
+        weekly_pairs = float(row.weekly_pairs or 0)
+        if weekly_pairs <= 0 and study_weeks:
+            weekly_pairs = max(round((row.total_hours / 2) / len(study_weeks), 2), 0.0)
+        whole_pairs = int(math.floor(weekly_pairs + 1e-9))
+        partial_pairs = max(weekly_pairs - whole_pairs, 0.0)
+        demands: list[SessionDemand] = []
+        common_metadata = {
+            "total_hours": row.total_hours,
+            "study_weeks": len(study_weeks),
+            "teacher_option_count": len(teacher_candidates),
+            "room_option_count": len(room_candidates),
+            "assignment_state": row.assignment_state,
+            "weekly_pairs": weekly_pairs,
+            "source_priority": row.source_priority,
+            "requires_special_room": bool(subject.requires_special_room if subject else False),
+            "preferred_teacher_id": row.resolved_teacher_id or row.fixed_teacher_id or 0,
+            "source_kind": "weekly",
+        }
+        for _ in range(max(whole_pairs, 0)):
+            demands.append(
+                SessionDemand(
+                    group_id=group.id or 0,
+                    subject_id=row.subject_id,
+                    teacher_candidates=teacher_candidates,
+                    room_candidates=room_candidates,
+                    week_scope=encode_week_scope(study_weeks),
+                    shift=group.shift,
+                    subgroup_code=row.subgroup_code,
+                    delivery_mode=row.delivery_mode or DELIVERY_OFFLINE,
+                    online_allowed=online_allowed,
+                    metadata=common_metadata.copy(),
+                )
+            )
+        if partial_pairs > 0.01 and study_weeks:
+            active_weeks = max(1, min(len(study_weeks), int(round(len(study_weeks) * partial_pairs))))
+            demands.append(
+                SessionDemand(
+                    group_id=group.id or 0,
+                    subject_id=row.subject_id,
+                    teacher_candidates=teacher_candidates,
+                    room_candidates=room_candidates,
+                    week_scope=encode_week_scope(spread_weeks(study_weeks, active_weeks)),
+                    shift=group.shift,
+                    subgroup_code=row.subgroup_code,
+                    delivery_mode=row.delivery_mode or DELIVERY_OFFLINE,
+                    online_allowed=online_allowed,
+                    metadata=common_metadata.copy(),
+                )
+            )
+        return demands
+
+    def _build_curriculum_demands(
         self,
         session: Session,
         group: Group,
@@ -148,6 +271,12 @@ class GreedyScheduleGenerator:
             "study_weeks": len(study_weeks),
             "teacher_option_count": len(teacher_candidates),
             "room_option_count": len(room_candidates),
+            "assignment_state": "legacy",
+            "weekly_pairs": load.pairs_per_week,
+            "source_priority": 10 if load.source_type != "manual" else 120,
+            "requires_special_room": bool(subject.requires_special_room if subject else False),
+            "preferred_teacher_id": 0,
+            "source_kind": load.source_type or "legacy",
         }
         demands = [
             SessionDemand(
@@ -181,9 +310,9 @@ class GreedyScheduleGenerator:
 
     def _apply_online_targets(self, session: Session, groups: list[Group], demands: list[SessionDemand]) -> None:
         group_map = {group.id: group for group in groups}
-        by_group: dict[int, list[SessionDemand]] = {}
+        by_group: dict[int, list[SessionDemand]] = defaultdict(list)
         for demand in demands:
-            by_group.setdefault(demand.group_id, []).append(demand)
+            by_group[demand.group_id].append(demand)
         for group_id, group_demands in by_group.items():
             group = group_map.get(group_id)
             if group is None:
@@ -191,7 +320,11 @@ class GreedyScheduleGenerator:
             target = self.online_policy_service.get_target_for_group(session, group)
             if target <= 0:
                 continue
-            eligible = [demand for demand in group_demands if demand.online_allowed]
+            eligible = [
+                demand
+                for demand in group_demands
+                if demand.online_allowed and not demand.metadata.get("subgroup_code")
+            ]
             if not eligible:
                 continue
             chosen: list[SessionDemand] = []
@@ -218,6 +351,7 @@ class GreedyScheduleGenerator:
 
     def _find_best_slot(
         self,
+        session: Session,
         entries: list[ScheduleEntry],
         demand: SessionDemand,
         origin: tuple[int, int, int] | None = None,
@@ -255,6 +389,7 @@ class GreedyScheduleGenerator:
 
     def _repair_single_blocker(
         self,
+        session: Session,
         entries: list[ScheduleEntry],
         demand: SessionDemand,
         schedule_id: int,
@@ -271,6 +406,7 @@ class GreedyScheduleGenerator:
                     blocker_demand = self._demand_from_entry(blocker)
                     remaining = [entry for entry in entries if entry is not blocker]
                     alternate = self._find_best_slot(
+                        session,
                         remaining,
                         blocker_demand,
                         origin=(blocker.day_of_week, blocker.pair_number, blocker.online_slot_number or 0),
@@ -285,6 +421,8 @@ class GreedyScheduleGenerator:
                     blocker.teacher_id = alt_teacher
                     blocker.room_id = alt_room
                     apply_timeslot_to_entry(blocker)
+                    if blocker.lesson_mode == LESSON_MODE_ONLINE:
+                        self.online_slot_service.apply_to_entry(session, blocker)
                     if self._violates_hard_constraints(
                         remaining + [blocker],
                         demand,
@@ -297,6 +435,7 @@ class GreedyScheduleGenerator:
                         continue
                     entries.append(
                         self._make_entry(
+                            session,
                             schedule_id,
                             demand,
                             (day_of_week, pair_number, online_slot_number, teacher_id, room_id),
@@ -307,7 +446,11 @@ class GreedyScheduleGenerator:
 
     def _candidate_slots(self, demand: SessionDemand) -> list[tuple[int, int, int | None]]:
         if demand.lesson_mode == LESSON_MODE_ONLINE:
-            return [(online_slot_day(slot_number), 0, slot_number) for slot_number in online_slot_numbers()]
+            return [
+                (slot.day_of_week, 0, slot.id)
+                for slot in sorted(self._online_slot_map.values(), key=lambda item: (item.order_index, item.id or 0))
+                if slot.is_active
+            ]
         return [
             (day_of_week, pair_number, None)
             for day_of_week in DAYS
@@ -325,18 +468,18 @@ class GreedyScheduleGenerator:
         room_id: int | None,
     ) -> list[ScheduleEntry]:
         blockers: list[ScheduleEntry] = []
+        start_time, end_time = self._candidate_times(pair_number, online_slot_number)
         for entry in entries:
-            if entry.lesson_mode != demand.lesson_mode:
-                continue
             if entry.day_of_week != day_of_week:
-                continue
-            if demand.lesson_mode == LESSON_MODE_REGULAR and entry.pair_number != pair_number:
-                continue
-            if demand.lesson_mode == LESSON_MODE_ONLINE and entry.online_slot_number != online_slot_number:
                 continue
             if not scopes_overlap(entry.week_scope, demand.week_scope):
                 continue
-            if entry.group_id == demand.group_id or entry.teacher_id == teacher_id:
+            if not intervals_overlap(entry.start_time, entry.end_time, start_time, end_time):
+                continue
+            if entry.teacher_id == teacher_id:
+                blockers.append(entry)
+                continue
+            if self._groups_overlap(entry, demand):
                 blockers.append(entry)
                 continue
             if demand.lesson_mode == LESSON_MODE_REGULAR and room_required(entry.delivery_mode) and room_required(demand.delivery_mode):
@@ -358,6 +501,7 @@ class GreedyScheduleGenerator:
 
     def _make_entry(
         self,
+        session: Session,
         schedule_id: int,
         demand: SessionDemand,
         placement: tuple[int, int, int | None, int, int | None],
@@ -374,11 +518,14 @@ class GreedyScheduleGenerator:
             online_slot_number=online_slot_number,
             lesson_mode=demand.lesson_mode,
             slot_category=demand.slot_category,
+            subgroup_code=demand.subgroup_code,
             week_scope=demand.week_scope,
             delivery_mode=demand.delivery_mode,
             locked=demand.locked,
         )
         apply_timeslot_to_entry(entry)
+        if entry.lesson_mode == LESSON_MODE_ONLINE:
+            self.online_slot_service.apply_to_entry(session, entry)
         return entry
 
     def _demand_from_entry(self, entry: ScheduleEntry) -> SessionDemand:
@@ -389,15 +536,16 @@ class GreedyScheduleGenerator:
             room_candidates=[entry.room_id],
             week_scope=entry.week_scope,
             shift=entry.shift,
+            subgroup_code=entry.subgroup_code,
             delivery_mode=entry.delivery_mode,
             lesson_mode=entry.lesson_mode,
             slot_category=entry.slot_category,
             locked=entry.locked,
-            metadata={"total_hours": 0},
+            metadata={"total_hours": 0, "weekly_pairs": self._entry_weekly_weight(entry)},
         )
 
-    @staticmethod
     def _soft_score(
+        self,
         entries: list[ScheduleEntry],
         demand: SessionDemand,
         day_of_week: int,
@@ -423,7 +571,13 @@ class GreedyScheduleGenerator:
             repair_distance = 0
             if origin is not None:
                 repair_distance = abs(day_of_week - origin[0]) * 10 + abs((online_slot_number or 0) - origin[2]) * 5
-            return spread_penalty + teacher_penalty + same_subject * 4 + repair_distance
+            return (
+                spread_penalty
+                + teacher_penalty
+                + same_subject * 4
+                + repair_distance
+                + self._teacher_balance_penalty(entries, demand, teacher_id)
+            )
 
         group_day_entries = [
             entry
@@ -463,7 +617,20 @@ class GreedyScheduleGenerator:
             + consecutive_penalty
             + compactness
             + repair_distance
+            + self._teacher_balance_penalty(entries, demand, teacher_id)
         )
+
+    def _teacher_balance_penalty(self, entries: list[ScheduleEntry], demand: SessionDemand, teacher_id: int) -> int:
+        other_semester = 4 if self._semester == 3 else 3
+        current_base = self._teacher_base_weekly_loads.get(teacher_id, {}).get(self._semester, 0.0)
+        other_base = self._teacher_base_weekly_loads.get(teacher_id, {}).get(other_semester, 0.0)
+        current_scheduled = sum(
+            self._entry_weekly_weight(entry)
+            for entry in entries
+            if entry.teacher_id == teacher_id
+        )
+        demand_weight = self._demand_weekly_weight(demand)
+        return int(round(abs((current_base + current_scheduled + demand_weight) - other_base) * 5))
 
     @staticmethod
     def _teacher_pressure(demands: list[SessionDemand]) -> Counter[int]:
@@ -473,18 +640,25 @@ class GreedyScheduleGenerator:
         return pressure
 
     @staticmethod
-    def _priority_key(demand: SessionDemand, teacher_pressure: Counter[int]) -> tuple[int, int, int, int, int, int]:
+    def _priority_key(demand: SessionDemand, teacher_pressure: Counter[int]) -> tuple[int, int, int, int, int, int, int, int]:
         teacher_option_count = len(demand.teacher_candidates) or 99
         room_option_count = len(demand.room_candidates) or 99
         pressure = max((teacher_pressure.get(teacher_id, 0) for teacher_id in demand.teacher_candidates), default=0)
         total_hours = int(demand.metadata.get("total_hours", 0))
+        source_priority = int(demand.metadata.get("source_priority", 0))
+        assignment_state = str(demand.metadata.get("assignment_state", "legacy"))
+        fixed_assignment = 0 if assignment_state == "fixed" else 1
+        subgroup_priority = 0 if demand.subgroup_code else 1
+        special_room_priority = 0 if bool(demand.metadata.get("requires_special_room", False)) else 1
         return (
             0 if demand.lesson_mode == LESSON_MODE_REGULAR else 1,
-            0 if demand.locked else 1,
+            fixed_assignment,
             teacher_option_count,
+            subgroup_priority,
+            special_room_priority,
             room_option_count,
             -pressure,
-            -total_hours,
+            -source_priority - total_hours,
         )
 
     @staticmethod
@@ -520,6 +694,22 @@ class GreedyScheduleGenerator:
             return [item.teacher_id for item in ordered]
         return []
 
+    def _teacher_candidates_for_weekly(self, session: Session, row: WeeklyLoad) -> list[int]:
+        teacher_ids: list[int] = []
+        if row.resolved_teacher_id:
+            teacher_ids.append(row.resolved_teacher_id)
+        if row.fixed_teacher_id and row.fixed_teacher_id not in teacher_ids:
+            teacher_ids.append(row.fixed_teacher_id)
+        for raw_id in (row.candidate_teacher_ids or "").split(","):
+            if not raw_id:
+                continue
+            teacher_id = int(raw_id)
+            if teacher_id not in teacher_ids:
+                teacher_ids.append(teacher_id)
+        if teacher_ids:
+            return teacher_ids
+        return self._teacher_candidates(session, row.group_id, row.subject_id)
+
     @staticmethod
     def _room_candidates(session: Session, subject_id: int) -> list[int | None]:
         subject = session.get(Subject, subject_id)
@@ -532,3 +722,63 @@ class GreedyScheduleGenerator:
             return []
         rooms = session.exec(select(Room).order_by(Room.code)).all()
         return [room.id or 0 for room in rooms]
+
+    def _candidate_times(self, pair_number: int, online_slot_number: int | None) -> tuple[str, str]:
+        if online_slot_number:
+            slot = self._online_slot_map.get(online_slot_number)
+            if slot is not None:
+                return slot.start_time, slot.end_time
+        if pair_number in (1, 2, 3, 4, 5, 6):
+            return pair_start(pair_number), pair_end(pair_number)
+        return "", ""
+
+    @staticmethod
+    def _groups_overlap(entry: ScheduleEntry, demand: SessionDemand) -> bool:
+        if entry.group_id != demand.group_id:
+            return False
+        if entry.subgroup_code and demand.subgroup_code and entry.subgroup_code != demand.subgroup_code:
+            return False
+        return True
+
+    def _teacher_semester_weekly_loads(self, session: Session) -> dict[int, dict[int, float]]:
+        loads: dict[int, dict[int, float]] = defaultdict(lambda: defaultdict(float))
+        rows = session.exec(select(WeeklyLoad).where(WeeklyLoad.is_active.is_(True))).all()
+        for row in rows:
+            teacher_id = row.resolved_teacher_id or row.fixed_teacher_id
+            if teacher_id:
+                loads[teacher_id][row.semester] += float(row.weekly_pairs or 0)
+        return loads
+
+    def _semester_study_week_counts(self, session: Session) -> dict[int, int]:
+        result: dict[int, int] = {}
+        for semester in (3, 4):
+            periods = session.exec(
+                select(AcademicPeriod).where(
+                    AcademicPeriod.semester == semester,
+                    AcademicPeriod.is_schedulable.is_(True),
+                )
+            ).all()
+            if periods:
+                result[semester] = max(1, len({period.week_number for period in periods}))
+        return {3: result.get(3, 16), 4: result.get(4, 16)}
+
+    def _entry_weekly_weight(self, entry: ScheduleEntry) -> float:
+        semester_weeks = max(self._semester_week_counts.get(self._semester, 16), 1)
+        if entry.week_scope == "all":
+            return 1.0
+        weeks = decode_week_scope(entry.week_scope)
+        if not weeks:
+            return 1.0
+        return round(len(weeks) / semester_weeks, 2)
+
+    def _demand_weekly_weight(self, demand: SessionDemand) -> float:
+        semester_weeks = max(self._semester_week_counts.get(self._semester, 16), 1)
+        if demand.week_scope == "all":
+            return 1.0
+        weeks = decode_week_scope(demand.week_scope)
+        if not weeks:
+            return 1.0
+        return round(len(weeks) / semester_weeks, 2)
+
+
+GreedyScheduleGenerator = HybridScheduleGenerator

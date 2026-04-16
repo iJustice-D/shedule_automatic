@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from itertools import combinations
+from pathlib import Path
 
 from fastapi import FastAPI
 from nicegui import ui
@@ -28,22 +30,31 @@ from app.core.timetable import (
     shift_label,
     visible_pairs_for_view,
 )
+from app.core.week_scope import format_week_scope, scopes_overlap
 from app.db.session import engine
 from app.models import AcademicPeriod, AppSetting, Conflict, CurriculumLoad, Department, Group, OnlinePolicy, Room, Schedule, ScheduleEntry, Subject, Suggestion, Teacher
+from app.models import OnlineSlot, WeeklyLoad
 from app.services.timetable_service import TimetableService
 from app.ui.i18n import t
 
 
 service = TimetableService()
 LANG = "ru"
+FAVICON_PATH = Path(__file__).resolve().parents[1] / "static" / "favicon.svg"
 
 
 def tr(key: str, **kwargs: object) -> str:
     return t(key, lang=LANG, **kwargs)
 
 
+def resolve_favicon() -> str | Path:
+    if FAVICON_PATH.exists():
+        return FAVICON_PATH
+    return "📅"
+
+
 def register_ui(app: FastAPI) -> None:
-    ui.run_with(app, storage_secret=settings.secret_key, title=tr("app.title"), favicon="calendar_month")
+    ui.run_with(app, storage_secret=settings.secret_key, title=tr("app.title"), favicon=resolve_favicon())
 
 
 def inject_styles() -> None:
@@ -68,10 +79,20 @@ def inject_styles() -> None:
           .hero-card { background: radial-gradient(circle at top right, #ffe8b8 0%, #fff8eb 55%, #f6edd7 100%); border: 1px solid var(--line); border-radius: 24px; }
           .panel-card { background: var(--panel); border: 1px solid var(--line); border-radius: 18px; }
           .grid-cell { min-height: 145px; }
-          .entry-chip { width: 100%; justify-content: flex-start; text-align: left; white-space: pre-wrap; }
+          .entry-chip { width: 100%; justify-content: flex-start; text-align: left; white-space: pre-wrap; padding: 0.65rem 0.75rem; border-radius: 14px; border: 1px solid rgba(107, 114, 128, 0.25); line-height: 1.35; }
           .entry-online { background: var(--online); }
           .entry-offline { background: var(--offline); }
           .entry-hybrid { background: #efe5ff; }
+          .slot-stack { display: flex; flex-direction: column; gap: 0.55rem; }
+          .lesson-card { width: 100%; align-items: stretch; }
+          .lesson-card .q-btn__content { display: block; width: 100%; text-align: left; align-items: flex-start; }
+          .lesson-card-conflict { border: 2px solid #dc2626 !important; background: #fff1f2 !important; }
+          .lesson-meta { font-size: 0.72rem; color: var(--muted); }
+          .empty-slot { color: var(--muted); font-size: 0.78rem; padding-top: 0.35rem; }
+          .badge-conflict { display: inline-block; background: #dc2626; color: white; border-radius: 999px; padding: 0.1rem 0.45rem; font-size: 0.68rem; font-weight: 700; margin-bottom: 0.25rem; }
+          .badge-overlap { display: inline-block; background: #f59e0b; color: #1f2933; border-radius: 999px; padding: 0.1rem 0.45rem; font-size: 0.68rem; font-weight: 700; margin-left: 0.35rem; }
+          .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 0.85rem; width: 100%; }
+          .modal-text { white-space: pre-wrap; line-height: 1.55; }
         </style>
         """
     )
@@ -141,6 +162,28 @@ def bool_label(value: bool) -> str:
     return tr("common.yes") if value else tr("common.no")
 
 
+def lesson_type_label(value: str) -> str:
+    labels = {
+        "mixed": tr("lesson_type.mixed"),
+        "lecture": tr("lesson_type.lecture"),
+        "practice": tr("lesson_type.practice"),
+    }
+    return labels.get(value, value)
+
+
+def lesson_type_options() -> dict[str, str]:
+    return {key: lesson_type_label(key) for key in ("mixed", "lecture", "practice")}
+
+
+def source_type_label(value: str) -> str:
+    mapping = {
+        "imported": tr("curriculum.source_imported"),
+        "manual": tr("curriculum.source_manual"),
+        "demo": tr("curriculum.source_demo"),
+    }
+    return mapping.get(value, value)
+
+
 def severity_label(value: str) -> str:
     return tr(f"severity.{value}")
 
@@ -150,11 +193,29 @@ def teacher_filter_options(rows: list[Teacher]) -> dict[int, str]:
 
 
 def load_online_slot_labels(session: Session) -> dict[int, str]:
-    settings_map = {item.key: item.value for item in session.exec(select(AppSetting)).all()}
-    return {
-        slot: settings_map.get(f"online_slot_{slot}_label") or online_slot_label(slot, lang=LANG)
-        for slot in online_slot_numbers()
-    }
+    slots = session.exec(select(OnlineSlot).order_by(OnlineSlot.order_index, OnlineSlot.id)).all()
+    if slots:
+        return {slot.id or 0: slot.label for slot in slots}
+    return {slot: online_slot_label(slot, lang=LANG) for slot in online_slot_numbers()}
+
+
+def load_online_slots(session: Session) -> list[OnlineSlot]:
+    slots = session.exec(select(OnlineSlot).order_by(OnlineSlot.order_index, OnlineSlot.id)).all()
+    return slots
+
+
+def week_scope_label(value: str) -> str:
+    text = format_week_scope(value, all_weeks_label=tr("editor.all_weeks"))
+    if text == tr("editor.all_weeks"):
+        return text
+    return f"{tr('editor.weeks')}: {text}"
+
+
+def slot_has_week_conflict(entries: list[ScheduleEntry]) -> bool:
+    for left, right in combinations(entries, 2):
+        if scopes_overlap(left.week_scope, right.week_scope):
+            return True
+    return False
 
 
 def entry_caption(entry: ScheduleEntry, subjects: dict[int, Subject], teachers: dict[int, Teacher], rooms: dict[int, Room]) -> str:
@@ -164,7 +225,8 @@ def entry_caption(entry: ScheduleEntry, subjects: dict[int, Subject], teachers: 
         f"{subjects[entry.subject_id].name}\n"
         f"{teacher}\n"
         f"{delivery_mode_label(entry.delivery_mode, lang=LANG)}\n"
-        f"{room_text}"
+        f"{room_text}\n"
+        f"{week_scope_label(entry.week_scope)}"
     )
 
 
@@ -179,13 +241,15 @@ def online_entry_caption(
         f"{slot_labels.get(entry.online_slot_number or 1, online_slot_label(entry.online_slot_number or 1, lang=LANG))}\n"
         f"{subjects[entry.subject_id].name}\n"
         f"{teacher}\n"
-        f"{tr('lesson_mode.online')}"
+        f"{tr('lesson_mode.online')}\n"
+        f"{week_scope_label(entry.week_scope)}"
     )
 
 
-def button_class_for_entry(entry: ScheduleEntry) -> str:
+def button_class_for_entry(entry: ScheduleEntry, conflict: bool = False) -> str:
     suffix = "online" if entry.delivery_mode == "online" else "hybrid" if entry.delivery_mode == "hybrid" else "offline"
-    return f"entry-chip entry-{suffix} text-left text-xs"
+    extra = " lesson-card-conflict" if conflict else ""
+    return f"entry-chip lesson-card entry-{suffix} text-left text-xs{extra}"
 
 
 @ui.page("/")
@@ -219,26 +283,119 @@ def dashboard_page() -> None:
 def groups_page() -> None:
     with page_shell(tr("page.groups")):
         with session_scope() as session:
-            rows = session.exec(select(Group).order_by(Group.code)).all()
-        ui.table(
-            columns=[
-                {"name": "code", "label": tr("common.code"), "field": "code"},
-                {"name": "name", "label": tr("common.name"), "field": "name"},
-                {"name": "course", "label": tr("common.course"), "field": "course"},
-                {"name": "year", "label": tr("groups.year"), "field": "year"},
-                {"name": "semester", "label": tr("common.semester"), "field": "semester"},
-                {"name": "student_count", "label": tr("common.students"), "field": "student_count"},
-                {"name": "shift", "label": tr("common.shift"), "field": "shift"},
-            ],
-            rows=[
-                {
-                    **row.model_dump(),
-                    "shift": shift_label(row.shift, lang=LANG),
-                }
-                for row in rows
-            ],
-            row_key="id",
-        ).classes("panel-card w-full")
+            departments = session.exec(select(Department).order_by(Department.code)).all()
+        state = {"selected_group_id": None}
+
+        @ui.refreshable
+        def render_groups() -> None:
+            with session_scope() as session:
+                rows = session.exec(select(Group).order_by(Group.code)).all()
+                department_map = {item.id: item for item in session.exec(select(Department)).all()}
+            if rows and state["selected_group_id"] not in {row.id for row in rows}:
+                state["selected_group_id"] = rows[0].id
+            ui.table(
+                columns=[
+                    {"name": "code", "label": tr("groups.code"), "field": "code"},
+                    {"name": "name", "label": tr("groups.name"), "field": "name"},
+                    {"name": "course", "label": tr("common.course"), "field": "course"},
+                    {"name": "year", "label": tr("groups.year"), "field": "year"},
+                    {"name": "semester", "label": tr("common.semester"), "field": "semester"},
+                    {"name": "student_count", "label": tr("groups.student_count"), "field": "student_count"},
+                    {"name": "shift", "label": tr("common.shift"), "field": "shift"},
+                    {"name": "department", "label": tr("common.department"), "field": "department"},
+                ],
+                rows=[
+                    {
+                        **row.model_dump(),
+                        "shift": shift_label(row.shift, lang=LANG),
+                        "department": department_map.get(row.home_department_id).code if row.home_department_id in department_map else tr("common.none"),
+                    }
+                    for row in rows
+                ],
+                row_key="id",
+            ).classes("panel-card w-full")
+            with ui.row().classes("gap-3 mt-3 items-end"):
+                ui.select(
+                    selection_options(rows),
+                    value=state["selected_group_id"],
+                    label=tr("groups.choose"),
+                    on_change=lambda event: state.update({"selected_group_id": event.value}),
+                ).classes("w-72")
+                ui.button(tr("groups.add"), on_click=lambda: open_group_dialog()).props("color=amber-8")
+                ui.button(tr("groups.edit"), on_click=lambda: open_group_dialog(state["selected_group_id"])).props("outline color=dark")
+                ui.button(tr("common.delete"), on_click=lambda: delete_group(state["selected_group_id"])).props("outline color=negative")
+
+        def open_group_dialog(group_id: int | None = None) -> None:
+            group = None
+            if group_id:
+                with session_scope() as session:
+                    group = session.get(Group, group_id)
+            with ui.dialog() as dialog, ui.card().classes("panel-card p-5 min-w-[760px]"):
+                ui.label(tr("groups.edit") if group else tr("groups.add")).classes("text-lg font-semibold")
+                with ui.column().classes("w-full gap-3"):
+                    with ui.element("div").classes("form-grid"):
+                        code = ui.input(tr("groups.code"), value=group.code if group else "")
+                        name = ui.input(tr("groups.name"), value=group.name if group else "")
+                        course = ui.number(tr("common.course"), value=group.course if group else 2, min=1, max=4, precision=0)
+                        year = ui.number(tr("groups.year"), value=group.year if group else 2, min=1, max=4, precision=0)
+                        semester = ui.number(tr("common.semester"), value=group.semester if group else 3, min=1, max=8, precision=0)
+                        student_count = ui.number(tr("groups.student_count"), value=group.student_count if group else 25, min=0, precision=0)
+                        shift = ui.select(shift_options(), value=group.shift if group else "morning", label=tr("common.shift"))
+                        department = ui.select(
+                            selection_options(departments, "code"),
+                            value=group.home_department_id if group else (departments[0].id if departments else None),
+                            label=tr("common.department"),
+                        )
+                with ui.row().classes("justify-end gap-2 w-full"):
+                    ui.button(tr("common.cancel"), on_click=dialog.close).props("flat")
+                    ui.button(
+                        tr("common.save"),
+                        on_click=lambda: save_group(
+                            group_id,
+                            {
+                                "code": (code.value or "").strip(),
+                                "name": (name.value or "").strip() or (code.value or "").strip(),
+                                "home_department_id": int(department.value or 0),
+                                "course": int(course.value or 1),
+                                "year": int(year.value or 1),
+                                "semester": int(semester.value or 1),
+                                "student_count": int(student_count.value or 0),
+                                "shift": shift.value or "morning",
+                            },
+                            dialog,
+                        ),
+                    ).props("color=amber-8")
+            dialog.open()
+
+        def save_group(group_id: int | None, payload: dict, dialog) -> None:
+            try:
+                with session_scope() as session:
+                    if group_id:
+                        service.update_group(session, group_id, payload)
+                    else:
+                        service.create_group(session, payload)
+            except ValueError as exc:
+                ui.notify(str(exc), color="negative")
+                return
+            dialog.close()
+            ui.notify(tr("groups.updated") if group_id else tr("groups.created"), color="positive")
+            render_groups.refresh()
+
+        def delete_group(group_id: int | None) -> None:
+            if not group_id:
+                ui.notify(tr("common.required_fields"), color="negative")
+                return
+            try:
+                with session_scope() as session:
+                    service.delete_group(session, group_id)
+            except ValueError as exc:
+                ui.notify(str(exc), color="negative")
+                return
+            ui.notify(tr("groups.deleted"), color="positive")
+            state["selected_group_id"] = None
+            render_groups.refresh()
+
+        render_groups()
 
 
 @ui.page("/teachers")
@@ -315,30 +472,117 @@ def teachers_page() -> None:
 @ui.page("/subjects")
 def subjects_page() -> None:
     with page_shell(tr("page.subjects")):
+        with session_scope() as session:
+            departments = session.exec(select(Department).order_by(Department.code)).all()
+        state = {"selected_subject_id": None}
+
         @ui.refreshable
         def render_subjects() -> None:
             with session_scope() as session:
                 rows = session.exec(select(Subject).order_by(Subject.name)).all()
+                department_map = {item.id: item for item in session.exec(select(Department)).all()}
+            if rows and state["selected_subject_id"] not in {row.id for row in rows}:
+                state["selected_subject_id"] = rows[0].id
             ui.table(
                 columns=[
-                    {"name": "code", "label": tr("common.code"), "field": "code"},
-                    {"name": "name", "label": tr("common.name"), "field": "name"},
+                    {"name": "code", "label": tr("subjects.code"), "field": "code"},
+                    {"name": "name", "label": tr("subjects.name"), "field": "name"},
                     {"name": "lesson_type", "label": tr("subjects.lesson_type"), "field": "lesson_type"},
                     {"name": "requires_special_room", "label": tr("subjects.special_room"), "field": "requires_special_room"},
                     {"name": "can_be_online", "label": tr("subjects.can_be_online"), "field": "can_be_online"},
                     {"name": "default_delivery_mode", "label": tr("subjects.default_delivery_mode"), "field": "default_delivery_mode"},
+                    {"name": "department", "label": tr("common.department"), "field": "department"},
                 ],
                 rows=[
                     {
                         **row.model_dump(),
+                        "lesson_type": lesson_type_label(row.lesson_type),
                         "requires_special_room": bool_label(row.requires_special_room),
                         "can_be_online": bool_label(row.can_be_online),
                         "default_delivery_mode": delivery_mode_label(row.default_delivery_mode, lang=LANG),
+                        "department": department_map.get(row.owner_department_id).code if row.owner_department_id in department_map else tr("common.none"),
                     }
                     for row in rows
                 ],
                 row_key="id",
             ).classes("panel-card w-full")
+            with ui.row().classes("gap-3 mt-3 items-end"):
+                ui.select(
+                    selection_options(rows, "name"),
+                    value=state["selected_subject_id"],
+                    label=tr("subjects.choose"),
+                    on_change=lambda event: state.update({"selected_subject_id": event.value}),
+                ).classes("w-80")
+                ui.button(tr("subjects.add"), on_click=lambda: open_subject_dialog()).props("color=amber-8")
+                ui.button(tr("subjects.edit"), on_click=lambda: open_subject_dialog(state["selected_subject_id"])).props("outline color=dark")
+                ui.button(tr("common.delete"), on_click=lambda: delete_subject(state["selected_subject_id"])).props("outline color=negative")
+
+        def open_subject_dialog(subject_id: int | None = None) -> None:
+            subject = None
+            if subject_id:
+                with session_scope() as session:
+                    subject = session.get(Subject, subject_id)
+            with ui.dialog() as dialog, ui.card().classes("panel-card p-5 min-w-[780px]"):
+                ui.label(tr("subjects.edit") if subject else tr("subjects.add")).classes("text-lg font-semibold")
+                with ui.element("div").classes("form-grid"):
+                    code = ui.input(tr("subjects.code"), value=subject.code if subject else "")
+                    name = ui.input(tr("subjects.name"), value=subject.name if subject else "")
+                    lesson_type = ui.select(lesson_type_options(), value=subject.lesson_type if subject else "mixed", label=tr("subjects.lesson_type"))
+                    requires_special_room = ui.switch(tr("subjects.special_room"), value=subject.requires_special_room if subject else False)
+                    can_be_online = ui.switch(tr("subjects.can_be_online"), value=subject.can_be_online if subject else False)
+                    default_delivery_mode = ui.select(delivery_options(), value=subject.default_delivery_mode if subject else "offline", label=tr("subjects.default_delivery_mode"))
+                    department = ui.select(
+                        selection_options(departments, "code"),
+                        value=subject.owner_department_id if subject else (departments[0].id if departments else None),
+                        label=tr("common.department"),
+                    )
+                with ui.row().classes("justify-end gap-2 w-full mt-3"):
+                    ui.button(tr("common.cancel"), on_click=dialog.close).props("flat")
+                    ui.button(
+                        tr("common.save"),
+                        on_click=lambda: save_subject(
+                            subject_id,
+                            {
+                                "code": (code.value or "").strip(),
+                                "name": (name.value or "").strip(),
+                                "owner_department_id": int(department.value or 0),
+                                "lesson_type": lesson_type.value or "mixed",
+                                "requires_special_room": bool(requires_special_room.value),
+                                "can_be_online": bool(can_be_online.value),
+                                "default_delivery_mode": default_delivery_mode.value or "offline",
+                            },
+                            dialog,
+                        ),
+                    ).props("color=amber-8")
+            dialog.open()
+
+        def save_subject(subject_id: int | None, payload: dict, dialog) -> None:
+            try:
+                with session_scope() as session:
+                    if subject_id:
+                        service.update_subject(session, subject_id, payload)
+                    else:
+                        service.create_subject(session, payload)
+            except ValueError as exc:
+                ui.notify(str(exc), color="negative")
+                return
+            dialog.close()
+            ui.notify(tr("subjects.updated") if subject_id else tr("subjects.created"), color="positive")
+            render_subjects.refresh()
+
+        def delete_subject(subject_id: int | None) -> None:
+            if not subject_id:
+                ui.notify(tr("common.required_fields"), color="negative")
+                return
+            try:
+                with session_scope() as session:
+                    service.delete_subject(session, subject_id)
+            except ValueError as exc:
+                ui.notify(str(exc), color="negative")
+                return
+            ui.notify(tr("subjects.deleted"), color="positive")
+            state["selected_subject_id"] = None
+            render_subjects.refresh()
 
         render_subjects()
 
@@ -400,35 +644,165 @@ def curriculum_page() -> None:
     with page_shell(tr("page.curriculum")):
         with session_scope() as session:
             groups = session.exec(select(Group).order_by(Group.code)).all()
-        state = {"group_id": groups[0].id if groups else None, "semester": 3}
+            subjects = session.exec(select(Subject).order_by(Subject.name)).all()
+        state = {
+            "group_id": groups[0].id if groups else None,
+            "semester": 3,
+            "subject_filter": 0,
+            "selected_load_id": None,
+        }
+
+        with ui.card().classes("panel-card p-4 w-full"):
+            ui.label(tr("curriculum.weekly_import_title")).classes("text-lg font-semibold")
+            workload_path = ui.input(
+                tr("curriculum.weekly_import_path"),
+                value=str(settings.weekly_workload_source or ""),
+                placeholder=str(settings.weekly_workload_source or ""),
+            ).classes("w-full")
+            import_selected_only = ui.switch(tr("curriculum.import_selected_group_only"), value=True)
+
+            def import_weekly_workload() -> None:
+                try:
+                    target_group_codes = None
+                    if import_selected_only.value and state["group_id"]:
+                        group = next((item for item in groups if item.id == state["group_id"]), None)
+                        target_group_codes = [group.code] if group else None
+                    with session_scope() as session:
+                        service.import_weekly_workload(
+                            session,
+                            Path(str(workload_path.value)),
+                            calendar_path=settings.calendar_source,
+                            curriculum_path=settings.curriculum_source,
+                            group_codes=target_group_codes,
+                        )
+                except ValueError as exc:
+                    ui.notify(str(exc), color="negative", multi_line=True)
+                    return
+                ui.notify(tr("curriculum.weekly_import_done"), color="positive", multi_line=True)
+                render_weekly_workload.refresh()
+                render_loads.refresh()
+
+            with ui.row().classes("gap-3 items-end w-full"):
+                ui.button(tr("curriculum.weekly_import_button"), on_click=import_weekly_workload).props("color=amber-8")
+                ui.label(tr("curriculum.weekly_import_hint")).classes("text-sm text-[#6b7280]")
+
+        @ui.refreshable
+        def render_weekly_workload() -> None:
+            with session_scope() as session:
+                query = select(WeeklyLoad).where(WeeklyLoad.is_active.is_(True))
+                if state["group_id"]:
+                    query = query.where(WeeklyLoad.group_id == state["group_id"])
+                if state["semester"]:
+                    query = query.where(WeeklyLoad.semester == state["semester"])
+                rows = session.exec(query.order_by(WeeklyLoad.group_id, WeeklyLoad.semester, WeeklyLoad.subject_id)).all()
+                subject_map = {subject.id: subject for subject in session.exec(select(Subject)).all()}
+                group_map = {group.id: group for group in session.exec(select(Group)).all()}
+                unresolved_rows = service.unresolved_weekly_rows(session, semester=state["semester"])
+                balance_rows = service.teacher_balance_report(session)
+            with ui.card().classes("panel-card p-4 w-full mt-4"):
+                ui.label(tr("curriculum.weekly_review_title")).classes("text-lg font-semibold")
+                if not rows:
+                    ui.label(tr("curriculum.weekly_empty")).classes("text-sm text-[#6b7280]")
+                else:
+                    ui.table(
+                        columns=[
+                            {"name": "group", "label": tr("common.group"), "field": "group"},
+                            {"name": "subject", "label": tr("common.subject"), "field": "subject"},
+                            {"name": "semester", "label": tr("common.semester"), "field": "semester"},
+                            {"name": "category", "label": tr("curriculum.weekly_category"), "field": "category"},
+                            {"name": "subgroup", "label": tr("curriculum.subgroup"), "field": "subgroup"},
+                            {"name": "weekly_hours", "label": tr("curriculum.hours_per_week"), "field": "weekly_hours"},
+                            {"name": "weekly_pairs", "label": tr("curriculum.pairs_per_week"), "field": "weekly_pairs"},
+                            {"name": "teacher_state", "label": tr("curriculum.teacher_state"), "field": "teacher_state"},
+                            {"name": "teachers", "label": tr("curriculum.teacher_names"), "field": "teachers"},
+                        ],
+                        rows=[
+                            {
+                                "id": row.id,
+                                "group": group_map.get(row.group_id).code if row.group_id in group_map else row.group_id,
+                                "subject": subject_map.get(row.subject_id).name if row.subject_id in subject_map else row.subject_id,
+                                "semester": row.semester,
+                                "category": tr(f"curriculum.category_{row.load_category}") if row.load_category in {"regular", "facultative", "practice", "study_practice", "industrial_practice"} else row.load_category,
+                                "subgroup": row.subgroup_code or "—",
+                                "weekly_hours": row.weekly_hours,
+                                "weekly_pairs": row.weekly_pairs,
+                                "teacher_state": tr(f"curriculum.assignment_{row.assignment_state}") if row.assignment_state in {"fixed", "multi_teacher", "vacancy", "unresolved_manual_review", "candidate_pool"} else row.assignment_state,
+                                "teachers": row.raw_teacher_names or "—",
+                            }
+                            for row in rows
+                        ],
+                        row_key="id",
+                    ).classes("w-full")
+            with ui.row().classes("w-full gap-4 mt-4 items-start"):
+                with ui.card().classes("panel-card p-4 grow"):
+                    ui.label(tr("curriculum.unresolved_title")).classes("text-lg font-semibold")
+                    if not unresolved_rows:
+                        ui.label(tr("curriculum.unresolved_empty")).classes("text-sm text-[#6b7280]")
+                    else:
+                        for row in unresolved_rows[:20]:
+                            subject_name = subject_map.get(row.subject_id).name if row.subject_id in subject_map else str(row.subject_id)
+                            group_name = group_map.get(row.group_id).code if row.group_id in group_map else str(row.group_id)
+                            ui.label(
+                                f"{group_name} | {subject_name} | "
+                                f"{tr(f'curriculum.assignment_{row.assignment_state}') if row.assignment_state in {'fixed', 'multi_teacher', 'vacancy', 'unresolved_manual_review', 'candidate_pool'} else row.assignment_state}"
+                            ).classes("text-sm")
+                with ui.card().classes("panel-card p-4 grow"):
+                    ui.label(tr("curriculum.teacher_balance_title")).classes("text-lg font-semibold")
+                    if not balance_rows:
+                        ui.label(tr("curriculum.teacher_balance_empty")).classes("text-sm text-[#6b7280]")
+                    else:
+                        ui.table(
+                            columns=[
+                                {"name": "teacher_name", "label": tr("common.teacher"), "field": "teacher_name"},
+                                {"name": "semester_3_pairs", "label": f"{tr('common.semester')} 3", "field": "semester_3_pairs"},
+                                {"name": "semester_4_pairs", "label": f"{tr('common.semester')} 4", "field": "semester_4_pairs"},
+                                {"name": "normalized_balance_score", "label": tr("curriculum.balance_score"), "field": "normalized_balance_score"},
+                                {"name": "pending_rows", "label": tr("curriculum.pending_rows"), "field": "pending_rows"},
+                            ],
+                            rows=balance_rows,
+                            row_key="teacher_id",
+                        ).classes("w-full")
 
         @ui.refreshable
         def render_loads() -> None:
             with session_scope() as session:
-                loads = session.exec(
-                    select(CurriculumLoad).where(
-                        CurriculumLoad.group_id == state["group_id"],
-                        CurriculumLoad.semester == state["semester"],
-                    )
-                ).all()
-                subjects = {subject.id: subject.name for subject in session.exec(select(Subject)).all()}
+                query = select(CurriculumLoad).where(CurriculumLoad.group_id == state["group_id"])
+                if state["semester"]:
+                    query = query.where(CurriculumLoad.semester == state["semester"])
+                if state["subject_filter"]:
+                    query = query.where(CurriculumLoad.subject_id == state["subject_filter"])
+                loads = session.exec(query.order_by(CurriculumLoad.subject_id)).all()
+                subject_map = {subject.id: subject for subject in session.exec(select(Subject)).all()}
+                duplicate_groups: dict[tuple[int, int, int], int] = {}
+                for item in session.exec(select(CurriculumLoad).where(CurriculumLoad.group_id == state["group_id"])).all():
+                    key = (item.group_id, item.subject_id, item.semester)
+                    duplicate_groups[key] = duplicate_groups.get(key, 0) + 1
+            if loads and state["selected_load_id"] not in {load.id for load in loads}:
+                state["selected_load_id"] = loads[0].id
+            has_duplicates = any(count > 1 for count in duplicate_groups.values())
+            if has_duplicates:
+                ui.label(tr("curriculum.duplicates_warning")).classes("text-sm text-[#9a3412]")
             rows = [
                 {
-                    "subject": subjects[load.subject_id],
+                    "id": load.id,
+                    "subject": subject_map.get(load.subject_id).name if load.subject_id in subject_map else tr("common.none"),
                     "total_hours": load.total_hours,
                     "raw_total_hours": load.raw_total_hours,
                     "practice_hours": load.practice_hours,
                     "study_weeks": load.study_weeks,
                     "hours_per_week": load.hours_per_week,
                     "pairs_per_week": load.pairs_per_week,
-                    "lesson_type": load.lesson_type,
+                    "lesson_type": lesson_type_label(load.lesson_type),
                     "delivery_mode": delivery_mode_label(load.delivery_mode, lang=LANG),
+                    "source_type": source_type_label(load.source_type),
+                    "note": load.note,
                 }
                 for load in loads
             ]
             ui.table(
                 columns=[
                     {"name": "subject", "label": tr("common.subject"), "field": "subject"},
+                    {"name": "source_type", "label": tr("common.source"), "field": "source_type"},
                     {"name": "total_hours", "label": tr("curriculum.schedulable_hours"), "field": "total_hours"},
                     {"name": "raw_total_hours", "label": tr("curriculum.raw_hours"), "field": "raw_total_hours"},
                     {"name": "practice_hours", "label": tr("curriculum.practice_hours"), "field": "practice_hours"},
@@ -437,10 +811,27 @@ def curriculum_page() -> None:
                     {"name": "pairs_per_week", "label": tr("curriculum.pairs_per_week"), "field": "pairs_per_week"},
                     {"name": "lesson_type", "label": tr("subjects.lesson_type"), "field": "lesson_type"},
                     {"name": "delivery_mode", "label": tr("common.delivery_mode"), "field": "delivery_mode"},
+                    {"name": "note", "label": tr("common.note"), "field": "note"},
                 ],
                 rows=rows,
-                row_key="subject",
+                row_key="id",
             ).classes("panel-card w-full")
+            with ui.row().classes("gap-3 mt-3 items-end"):
+                ui.select(
+                    {0: tr("common.all"), **{subject.id or 0: subject.name for subject in subjects}},
+                    value=state["subject_filter"],
+                    label=tr("common.subject"),
+                    on_change=lambda event: (state.update({"subject_filter": event.value}), render_loads.refresh()),
+                ).classes("w-80")
+                ui.select(
+                    {load.id or 0: f"{subject_map.get(load.subject_id).name if load.subject_id in subject_map else tr('common.none')} | {tr('common.semester')} {load.semester}" for load in loads},
+                    value=state["selected_load_id"],
+                    label=tr("common.select_record"),
+                    on_change=lambda event: state.update({"selected_load_id": event.value}),
+                ).classes("w-[26rem]")
+                ui.button(tr("curriculum.add"), on_click=lambda: open_load_dialog()).props("color=amber-8")
+                ui.button(tr("curriculum.edit"), on_click=lambda: open_load_dialog(state["selected_load_id"])).props("outline color=dark")
+                ui.button(tr("common.delete"), on_click=lambda: delete_load(state["selected_load_id"])).props("outline color=negative")
 
         with ui.row().classes("gap-3"):
             ui.select(
@@ -455,7 +846,132 @@ def curriculum_page() -> None:
                 label=tr("common.semester"),
                 on_change=lambda event: (state.update({"semester": event.value}), render_loads.refresh()),
             )
+        def open_load_dialog(load_id: int | None = None) -> None:
+            with session_scope() as session:
+                subjects_local = session.exec(select(Subject).order_by(Subject.name)).all()
+                load = session.get(CurriculumLoad, load_id) if load_id else None
+                subject = session.get(Subject, load.subject_id) if load else None
+            with ui.dialog() as dialog, ui.card().classes("panel-card p-5 min-w-[860px]"):
+                ui.label(tr("curriculum.edit") if load else tr("curriculum.add")).classes("text-lg font-semibold")
+                with ui.element("div").classes("form-grid"):
+                    group_id = ui.select(selection_options(groups), value=load.group_id if load else state["group_id"], label=tr("common.group"))
+                    subject_id = ui.select(
+                        selection_options(subjects_local, "name"),
+                        value=load.subject_id if load else None,
+                        label=tr("common.subject"),
+                    )
+                    semester = ui.select(
+                        {3: f"{tr('common.semester')} 3", 4: f"{tr('common.semester')} 4"},
+                        value=load.semester if load else state["semester"],
+                        label=tr("common.semester"),
+                    )
+                    total_hours = ui.number(tr("curriculum.total_hours"), value=load.total_hours if load else 64, min=0, precision=0)
+                    study_weeks = ui.number(tr("curriculum.study_weeks"), value=load.study_weeks if load else 16, min=1, precision=0)
+                    hours_per_week = ui.number(tr("curriculum.hours_per_week"), value=load.hours_per_week if load else 4.0, min=0, precision=2)
+                    pairs_per_week = ui.number(tr("curriculum.pairs_per_week"), value=load.pairs_per_week if load else 2.0, min=0, precision=2)
+                    lesson_type = ui.select(lesson_type_options(), value=load.lesson_type if load else (subject.lesson_type if subject else "mixed"), label=tr("subjects.lesson_type"))
+                    delivery_mode = ui.select(delivery_options(), value=load.delivery_mode if load else (subject.default_delivery_mode if subject else "offline"), label=tr("curriculum.delivery_type"))
+                    can_be_online = ui.switch(tr("subjects.can_be_online"), value=subject.can_be_online if subject else False)
+                    note = ui.textarea(tr("curriculum.manual_note"), value=load.note if load else "").classes("col-span-full")
+                auto_calc = ui.switch(tr("common.auto_calculation"), value=True)
+                ui.label(tr("curriculum.online_hint")).classes("text-xs text-[#6b7280]")
+
+                def recalculate(notify: bool = False) -> None:
+                    if not auto_calc.value:
+                        return
+                    weeks_value = float(study_weeks.value or 0)
+                    total_value = float(total_hours.value or 0)
+                    if weeks_value <= 0:
+                        return
+                    hours_value = round(total_value / weeks_value, 2)
+                    pairs_value = round(total_value / 2 / weeks_value, 2)
+                    hours_per_week.value = hours_value
+                    pairs_per_week.value = pairs_value
+                    if notify:
+                        ui.notify(tr("notify.calculated"), color="positive")
+
+                total_hours.on("update:model-value", lambda _event: recalculate())
+                study_weeks.on("update:model-value", lambda _event: recalculate())
+                subject_id.on(
+                    "update:model-value",
+                    lambda event: _apply_subject_defaults(event.value, subjects_local, lesson_type, delivery_mode, can_be_online),
+                )
+
+                with ui.row().classes("justify-between items-center w-full mt-3"):
+                    ui.button(tr("common.calculate"), on_click=lambda: recalculate(True)).props("outline color=dark")
+                    with ui.row().classes("gap-2"):
+                        ui.button(tr("common.cancel"), on_click=dialog.close).props("flat")
+                        ui.button(
+                            tr("common.save"),
+                            on_click=lambda: save_load(
+                                load_id,
+                                {
+                                    "group_id": int(group_id.value or 0),
+                                    "subject_id": int(subject_id.value or 0),
+                                    "semester": int(semester.value or state["semester"] or 3),
+                                    "total_hours": int(total_hours.value or 0),
+                                    "study_weeks": int(study_weeks.value or 0),
+                                    "hours_per_week": float(hours_per_week.value or 0),
+                                    "pairs_per_week": float(pairs_per_week.value or 0),
+                                    "lesson_type": lesson_type.value or "mixed",
+                                    "delivery_mode": delivery_mode.value or "offline",
+                                    "raw_total_hours": int(total_hours.value or 0),
+                                    "practice_hours": load.practice_hours if load else 0,
+                                    "source_code": load.source_code if load else "manual",
+                                    "source_type": load.source_type if load else "manual",
+                                    "note": note.value or "",
+                                },
+                                bool(can_be_online.value),
+                                dialog,
+                            ),
+                        ).props("color=amber-8")
+            dialog.open()
+
+        def _apply_subject_defaults(subject_id: int | None, subject_rows: list[Subject], lesson_type_widget, delivery_widget, online_widget) -> None:
+            subject = next((item for item in subject_rows if item.id == subject_id), None)
+            if subject is None:
+                return
+            lesson_type_widget.value = subject.lesson_type
+            delivery_widget.value = subject.default_delivery_mode
+            online_widget.value = subject.can_be_online
+
+        def save_load(load_id: int | None, payload: dict, allow_online: bool, dialog) -> None:
+            try:
+                with session_scope() as session:
+                    subject = session.get(Subject, payload["subject_id"])
+                    if subject is not None:
+                        subject.can_be_online = allow_online
+                        session.add(subject)
+                        session.commit()
+                        if not load_id:
+                            payload["source_code"] = subject.code
+                    if load_id:
+                        service.update_curriculum_load(session, load_id, payload)
+                    else:
+                        service.create_curriculum_load(session, payload)
+            except ValueError as exc:
+                ui.notify(str(exc), color="negative", multi_line=True)
+                return
+            dialog.close()
+            ui.notify(tr("curriculum.updated") if load_id else tr("curriculum.created"), color="positive")
+            render_loads.refresh()
+
+        def delete_load(load_id: int | None) -> None:
+            if not load_id:
+                ui.notify(tr("common.required_fields"), color="negative")
+                return
+            try:
+                with session_scope() as session:
+                    service.delete_curriculum_load(session, load_id)
+            except ValueError as exc:
+                ui.notify(str(exc), color="negative")
+                return
+            state["selected_load_id"] = None
+            ui.notify(tr("curriculum.deleted"), color="positive")
+            render_loads.refresh()
+
         render_loads()
+        render_weekly_workload()
 
 
 @ui.page("/generator")
@@ -528,6 +1044,7 @@ def editor_page() -> None:
                 teacher_map = {teacher.id: teacher for teacher in session.exec(select(Teacher)).all()}
                 room_map = {room.id: room for room in session.exec(select(Room)).all()}
                 slot_labels = load_online_slot_labels(session)
+                online_slots = [slot for slot in load_online_slots(session) if slot.is_active]
             filtered = entries
             selected_group = group_map.get(state["group_id"])
             if state["view_mode"] == "group" and state["group_id"]:
@@ -543,6 +1060,35 @@ def editor_page() -> None:
                 selected_group.shift if selected_group else None,
                 state["shift_filter"],
             )
+
+            def render_slot_cards(slot_entries: list[ScheduleEntry], *, online: bool = False) -> None:
+                if not slot_entries:
+                    ui.label(tr("common.free")).classes("empty-slot")
+                    return
+                has_conflict = slot_has_week_conflict(slot_entries)
+                with ui.column().classes("slot-stack w-full"):
+                    for entry in sorted(
+                        slot_entries,
+                        key=lambda item: (
+                            item.online_slot_number or 0,
+                            item.subject_id,
+                            format_week_scope(item.week_scope, all_weeks_label=tr("editor.all_weeks")),
+                        ),
+                    ):
+                        caption = (
+                            online_entry_caption(entry, subjects, teacher_map, slot_labels)
+                            if online
+                            else entry_caption(entry, subjects, teacher_map, room_map)
+                        )
+                        if has_conflict:
+                            caption = (
+                                f"{tr('editor.conflict_badge')} | {tr('editor.overlap_badge')}\n"
+                                f"{caption}"
+                            )
+                        ui.button(
+                            caption,
+                            on_click=lambda e=entry: open_edit_dialog(e.id or 0),
+                        ).props("flat").classes(button_class_for_entry(entry, conflict=has_conflict))
 
             with ui.column().classes("w-full gap-2 mt-3"):
                 ui.label(tr("editor.main_schedule")).classes("text-lg font-semibold")
@@ -565,19 +1111,13 @@ def editor_page() -> None:
                                 slot_entries = [
                                     entry for entry in regular_entries if entry.day_of_week == day_of_week and entry.pair_number == pair_number
                                 ]
-                                if not slot_entries:
-                                    ui.label(tr("common.free")).classes("text-xs text-[#6b7280]")
-                                for entry in slot_entries:
-                                    ui.button(
-                                        entry_caption(entry, subjects, teacher_map, room_map),
-                                        on_click=lambda e=entry: open_edit_dialog(e.id or 0),
-                                    ).props("flat").classes(button_class_for_entry(entry))
+                                render_slot_cards(slot_entries)
                 ui.label(tr("editor.online_schedule")).classes("text-lg font-semibold mt-4")
                 if not online_entries:
                     ui.label(tr("editor.no_online_lessons")).classes("text-sm text-[#6b7280]")
                 else:
                     with ui.row().classes("w-full gap-3"):
-                        for day_of_week in ONLINE_ALLOWED_DAYS:
+                        for day_of_week in sorted({slot.day_of_week for slot in online_slots} or set(ONLINE_ALLOWED_DAYS)):
                             with ui.card().classes("panel-card p-4 grow"):
                                 ui.label(day_label(day_of_week, lang=LANG)).classes("font-bold")
                                 day_entries = [
@@ -585,36 +1125,117 @@ def editor_page() -> None:
                                     for entry in online_entries
                                     if entry.day_of_week == day_of_week
                                 ]
-                                if not day_entries:
-                                    ui.label(tr("common.free")).classes("text-xs text-[#6b7280]")
-                                for entry in sorted(day_entries, key=lambda item: item.online_slot_number or 0):
-                                    ui.button(
-                                        online_entry_caption(entry, subjects, teacher_map, slot_labels),
-                                        on_click=lambda e=entry: open_edit_dialog(e.id or 0),
-                                    ).props("flat").classes("entry-chip entry-online text-left text-xs")
+                                render_slot_cards(day_entries, online=True)
 
         @ui.refreshable
         def render_feedback() -> None:
             if not state["schedule_id"]:
                 return
             with session_scope() as session:
-                conflicts = session.exec(select(Conflict).where(Conflict.schedule_id == state["schedule_id"])).all()
+                diagnostics = service.result_diagnostics(session, state["schedule_id"], state["group_id"] or None)
+                related_conflict_ids = [
+                    conflict.id
+                    for conflict in diagnostics["hard_conflicts"] + diagnostics["unscheduled_conflicts"]
+                    if conflict.id is not None
+                ]
                 suggestions = session.exec(
                     select(Suggestion).where(
-                        Suggestion.conflict_id.in_([item.id for item in conflicts if item.id is not None])
+                        Suggestion.conflict_id.in_(related_conflict_ids)
                     )
                 ).all()
-            ui.label(tr("editor.after_edit_conflicts")).classes("text-lg font-semibold mt-4")
-            if not conflicts:
-                ui.label(tr("editor.no_conflicts"))
-                return
-            for conflict in conflicts:
-                with ui.expansion(f"[{severity_label(conflict.severity)}] {conflict.message}", value=False).classes("panel-card w-full"):
-                    for suggestion in sorted(
-                        [item for item in suggestions if item.conflict_id == conflict.id],
-                        key=lambda item: item.rank,
-                    ):
-                        ui.label(f"{suggestion.rank}. {suggestion.message}")
+            summary = diagnostics["summary"]
+            ui.label(tr("editor.result_summary")).classes("text-lg font-semibold mt-4")
+            with ui.grid(columns=4).classes("w-full gap-3"):
+                summary_rows = [
+                    (tr("editor.summary_group"), summary["selected_group"]),
+                    (tr("editor.summary_semester"), summary["selected_semester"]),
+                    (tr("editor.summary_expected_subjects"), summary["expected_subjects_count"]),
+                    (tr("editor.summary_fully_placed"), summary["fully_placed_subjects_count"]),
+                    (tr("editor.summary_partially_placed"), summary["partially_placed_subjects_count"]),
+                    (tr("editor.summary_not_placed"), summary["not_placed_subjects_count"]),
+                    (tr("editor.summary_missing_pairs"), summary["total_missing_pairs"]),
+                    (tr("editor.summary_hard_conflicts"), summary["hard_conflicts_count"]),
+                    (tr("editor.summary_online_placed"), summary["online_placed_count"]),
+                    (tr("editor.summary_online_missing"), summary["online_missing_count"]),
+                    (tr("editor.summary_unresolved_rows"), summary["unresolved_teacher_rows_count"]),
+                    (tr("editor.summary_teacher_balance"), summary["teachers_with_balance_issue_count"]),
+                ]
+                for label, value in summary_rows:
+                    with ui.card().classes("panel-card p-3"):
+                        ui.label(label).classes("text-xs text-[#6b7280]")
+                        ui.label(str(value)).classes("text-xl font-semibold")
+
+            def render_conflict_section(title: str, conflicts: list[Conflict], empty_label: str) -> None:
+                ui.label(title).classes("text-lg font-semibold mt-4")
+                if not conflicts:
+                    ui.label(empty_label).classes("text-sm text-[#6b7280]")
+                    return
+                for conflict in conflicts:
+                    with ui.expansion(f"[{severity_label(conflict.severity)}] {conflict.message}", value=False).classes("panel-card w-full"):
+                        current_suggestions = sorted(
+                            [item for item in suggestions if item.conflict_id == conflict.id],
+                            key=lambda item: item.rank,
+                        )
+                        for suggestion in current_suggestions:
+                            ui.label(f"{suggestion.rank}. {suggestion.message}")
+
+            render_conflict_section(
+                tr("editor.hard_conflicts"),
+                diagnostics["hard_conflicts"],
+                tr("editor.no_hard_conflicts"),
+            )
+            render_conflict_section(
+                tr("editor.unscheduled_load"),
+                diagnostics["unscheduled_conflicts"],
+                tr("editor.no_unscheduled_load"),
+            )
+
+            ui.label(tr("editor.warnings")).classes("text-lg font-semibold mt-4")
+            if not diagnostics["warnings"]:
+                ui.label(tr("editor.no_warnings")).classes("text-sm text-[#6b7280]")
+            else:
+                for item in diagnostics["warnings"]:
+                    with ui.card().classes("panel-card w-full p-3"):
+                        ui.label(str(item["message"])).classes("text-sm")
+
+            ui.label(tr("editor.normalization_issues")).classes("text-lg font-semibold mt-4")
+            if not diagnostics["normalization_issues"]:
+                ui.label(tr("editor.no_normalization_issues")).classes("text-sm text-[#6b7280]")
+            else:
+                for issue in diagnostics["normalization_issues"]:
+                    with ui.card().classes("panel-card w-full p-3"):
+                        ui.label(str(issue["subject"])).classes("font-semibold")
+                        ui.label(str(issue["message"])).classes("text-sm text-[#6b7280]")
+
+            ui.label(tr("editor.teacher_balance")).classes("text-lg font-semibold mt-4")
+            if not diagnostics["teacher_balance_rows"]:
+                ui.label(tr("editor.no_teacher_balance")).classes("text-sm text-[#6b7280]")
+            else:
+                ui.table(
+                    columns=[
+                        {"name": "teacher_name", "label": tr("common.teacher"), "field": "teacher_name"},
+                        {"name": "semester_3_pairs", "label": "Семестр 3", "field": "semester_3_pairs"},
+                        {"name": "semester_4_pairs", "label": "Семестр 4", "field": "semester_4_pairs"},
+                        {"name": "normalized_balance_score", "label": "Отклонение", "field": "normalized_balance_score"},
+                        {"name": "pending_rows", "label": "На уточнении", "field": "pending_rows"},
+                    ],
+                    rows=diagnostics["teacher_balance_rows"],
+                    row_key="teacher_id",
+                ).classes("panel-card w-full")
+
+            ui.label(tr("editor.subject_summary")).classes("text-lg font-semibold mt-4")
+            ui.table(
+                columns=[
+                    {"name": "subject", "label": tr("common.subject"), "field": "subject"},
+                    {"name": "expected_pairs", "label": tr("editor.subject_column_expected"), "field": "expected_pairs"},
+                    {"name": "placed_pairs", "label": tr("editor.subject_column_placed"), "field": "placed_pairs"},
+                    {"name": "missing_pairs", "label": tr("editor.subject_column_missing"), "field": "missing_pairs"},
+                    {"name": "status", "label": tr("editor.subject_column_status"), "field": "status"},
+                    {"name": "reason", "label": tr("editor.subject_column_reason"), "field": "reason"},
+                ],
+                rows=diagnostics["subject_rows"],
+                row_key="subject",
+            ).classes("panel-card w-full")
 
         def open_edit_dialog(entry_id: int) -> None:
             with session_scope() as session:
@@ -623,14 +1244,24 @@ def editor_page() -> None:
                 teachers_local = session.exec(select(Teacher).order_by(Teacher.full_name)).all()
                 rooms_local = session.exec(select(Room).order_by(Room.code)).all()
                 slot_labels = load_online_slot_labels(session)
+                online_slots = [slot for slot in load_online_slots(session) if slot.is_active]
+                slot_day_map = {slot.id or 0: slot.day_of_week for slot in online_slots}
                 schedule = session.get(Schedule, entry.schedule_id)
-                loads = session.exec(
+                manual_loads = session.exec(
                     select(CurriculumLoad).where(
                         CurriculumLoad.group_id == entry.group_id,
                         CurriculumLoad.semester == schedule.semester,
                     )
                 ).all()
-                subjects_local = [session.get(Subject, load.subject_id) for load in loads]
+                weekly_loads = session.exec(
+                    select(WeeklyLoad).where(
+                        WeeklyLoad.group_id == entry.group_id,
+                        WeeklyLoad.semester == schedule.semester,
+                        WeeklyLoad.is_active.is_(True),
+                    )
+                ).all()
+                subject_ids = {load.subject_id for load in manual_loads} | {load.subject_id for load in weekly_loads} | {entry.subject_id}
+                subjects_local = [session.get(Subject, subject_id) for subject_id in sorted(subject_ids)]
             subject_options = {subject.id or 0: subject.name for subject in subjects_local if subject is not None}
             room_options = {0: tr("editor.remove_room"), **selection_options(rooms_local, "code")}
             with ui.dialog() as dialog, ui.card().classes("panel-card p-4 min-w-[520px]"):
@@ -648,8 +1279,8 @@ def editor_page() -> None:
                 )
                 online_slot_number = ui.select(
                     {
-                        slot: f"{slot_labels[slot]} | {day_label(online_slot_day(slot), lang=LANG)}"
-                        for slot in online_slot_numbers()
+                        slot.id or 0: f"{slot.label} | {day_label(slot.day_of_week, lang=LANG)} | {slot.start_time}-{slot.end_time}"
+                        for slot in online_slots
                     },
                     value=entry.online_slot_number or 1,
                     label=tr("editor.change_online_slot"),
@@ -670,6 +1301,7 @@ def editor_page() -> None:
                             day_of_week=day_of_week.value,
                             pair_number=pair_number.value,
                             online_slot_number=online_slot_number.value,
+                            online_slot_days=slot_day_map,
                             teacher_id=teacher_id.value,
                             room_id=room_id.value,
                             delivery_mode=delivery_mode.value,
@@ -688,6 +1320,7 @@ def editor_page() -> None:
             day_of_week: int | None,
             pair_number: int | None,
             online_slot_number: int | None,
+            online_slot_days: dict[int, int] | None,
             teacher_id: int | None,
             room_id: int | None,
             delivery_mode: str,
@@ -700,7 +1333,7 @@ def editor_page() -> None:
                 return {
                     "subject_id": subject_id,
                     "lesson_mode": LESSON_MODE_ONLINE,
-                    "day_of_week": online_slot_day(slot_number),
+                    "day_of_week": (online_slot_days or {}).get(slot_number, day_of_week or 3),
                     "pair_number": 0,
                     "online_slot_number": slot_number,
                     "teacher_id": teacher_id,
@@ -781,45 +1414,95 @@ def conflicts_page() -> None:
     with page_shell(tr("page.conflicts")):
         with session_scope() as session:
             schedules = session.exec(select(Schedule).order_by(Schedule.created_at.desc())).all()
-        state = {"schedule_id": schedules[0].id if schedules else None}
+            groups = session.exec(select(Group).order_by(Group.code)).all()
+        state = {"schedule_id": schedules[0].id if schedules else None, "group_id": 0}
+        explanation_state = {"message": ""}
+
+        with ui.dialog() as explanation_dialog, ui.card().classes("panel-card p-5 min-w-[760px] max-w-[960px]"):
+            ui.label(tr("conflicts.ai_title")).classes("text-lg font-semibold")
+            explanation_label = ui.label().classes("modal-text text-sm")
+            with ui.row().classes("justify-end w-full mt-4"):
+                ui.button(tr("conflicts.ai_close"), on_click=explanation_dialog.close).props("outline color=dark")
 
         @ui.refreshable
         def render_conflicts() -> None:
             if not state["schedule_id"]:
                 return
             with session_scope() as session:
-                conflicts = session.exec(select(Conflict).where(Conflict.schedule_id == state["schedule_id"])).all()
+                diagnostics = service.result_diagnostics(session, state["schedule_id"], state["group_id"] or None)
+                related_conflict_ids = [
+                    conflict.id
+                    for conflict in diagnostics["hard_conflicts"] + diagnostics["unscheduled_conflicts"]
+                    if conflict.id is not None
+                ]
                 suggestions = session.exec(
                     select(Suggestion).where(
-                        Suggestion.conflict_id.in_([item.id for item in conflicts if item.id is not None])
+                        Suggestion.conflict_id.in_(related_conflict_ids)
                     )
                 ).all()
-            if not conflicts:
-                ui.label(tr("conflicts.none"))
-                return
-            for conflict in conflicts:
-                with ui.card().classes("panel-card w-full p-4"):
-                    ui.label(f"[{severity_label(conflict.severity)}] {conflict.message}").classes("font-semibold")
-                    for suggestion in sorted(
-                        [item for item in suggestions if item.conflict_id == conflict.id],
-                        key=lambda item: item.rank,
-                    ):
-                        ui.label(f"{suggestion.rank}. {suggestion.message}")
-                    ui.button(
-                        tr("conflicts.explain"),
-                        on_click=lambda c=conflict.id: _show_explanation(c or 0),
-                    ).props("outline color=dark").classes("mt-2")
+                global_unresolved = service.unresolved_weekly_rows(session)
+                global_balance = service.teacher_balance_report(session)
+            ui.label(tr("conflicts.current_result")).classes("text-lg font-semibold")
+            current_conflicts = diagnostics["hard_conflicts"] + diagnostics["unscheduled_conflicts"]
+            if not current_conflicts:
+                ui.label(tr("conflicts.none")).classes("text-sm text-[#6b7280]")
+            else:
+                for conflict in current_conflicts:
+                    with ui.card().classes("panel-card w-full p-4"):
+                        ui.label(f"[{severity_label(conflict.severity)}] {conflict.message}").classes("font-semibold")
+                        for suggestion in sorted(
+                            [item for item in suggestions if item.conflict_id == conflict.id],
+                            key=lambda item: item.rank,
+                        ):
+                            ui.label(f"{suggestion.rank}. {suggestion.message}")
+                        ui.button(
+                            tr("conflicts.explain"),
+                            on_click=lambda c=conflict.id: _show_explanation(c or 0),
+                        ).props("outline color=dark").classes("mt-2")
+
+            ui.label(tr("conflicts.global_diagnostics")).classes("text-lg font-semibold mt-4")
+            with ui.row().classes("w-full gap-4 items-start"):
+                with ui.card().classes("panel-card p-4 grow"):
+                    ui.label(tr("conflicts.global_unresolved")).classes("font-semibold")
+                    if not global_unresolved:
+                        ui.label(tr("curriculum.unresolved_empty")).classes("text-sm text-[#6b7280]")
+                    else:
+                        for row in global_unresolved[:20]:
+                            ui.label(f"{row.group_id} | {row.semester} | {row.assignment_state} | {row.raw_teacher_names or '—'}").classes("text-sm")
+                with ui.card().classes("panel-card p-4 grow"):
+                    ui.label(tr("conflicts.global_balance")).classes("font-semibold")
+                    if not global_balance:
+                        ui.label(tr("curriculum.teacher_balance_empty")).classes("text-sm text-[#6b7280]")
+                    else:
+                        ui.table(
+                            columns=[
+                                {"name": "teacher_name", "label": tr("common.teacher"), "field": "teacher_name"},
+                                {"name": "semester_3_pairs", "label": "Семестр 3", "field": "semester_3_pairs"},
+                                {"name": "semester_4_pairs", "label": "Семестр 4", "field": "semester_4_pairs"},
+                                {"name": "normalized_balance_score", "label": "Отклонение", "field": "normalized_balance_score"},
+                            ],
+                            rows=global_balance,
+                            row_key="teacher_id",
+                        ).classes("w-full")
 
         def _show_explanation(conflict_id: int) -> None:
             with session_scope() as session:
                 message = service.explain_conflict(session, conflict_id)
-            ui.notify(message, multi_line=True, timeout=8000)
+            explanation_state["message"] = message
+            explanation_label.set_text(explanation_state["message"])
+            explanation_dialog.open()
 
         ui.select(
             selection_options(schedules, "name"),
             value=state["schedule_id"],
             label=tr("common.schedule"),
             on_change=lambda event: (state.update({"schedule_id": event.value}), render_conflicts.refresh()),
+        )
+        ui.select(
+            {0: tr("common.all"), **selection_options(groups)},
+            value=state["group_id"],
+            label=tr("common.group"),
+            on_change=lambda event: (state.update({"group_id": event.value}), render_conflicts.refresh()),
         )
         render_conflicts()
 
@@ -856,6 +1539,7 @@ def settings_page() -> None:
             current_settings = {item.key: item.value for item in session.exec(select(AppSetting)).all()}
             groups = session.exec(select(Group).order_by(Group.code)).all()
             subjects = session.exec(select(Subject).order_by(Subject.name)).all()
+            online_slots = session.exec(select(OnlineSlot).order_by(OnlineSlot.order_index, OnlineSlot.id)).all()
             course_policies = {
                 policy.course: policy
                 for policy in session.exec(
@@ -943,27 +1627,69 @@ def settings_page() -> None:
 
         with ui.card().classes("panel-card p-4 w-full mt-4"):
             ui.label(tr("settings.online_slots")).classes("text-lg font-semibold")
-            slot_inputs = {
-                slot: ui.input(
-                    f"{tr('online_slot.label', slot=slot)}",
-                    value=current_settings.get(f"online_slot_{slot}_label", tr("online_slot.label", slot=slot)),
-                ).classes("w-full")
-                for slot in online_slot_numbers()
-            }
 
-            def _save_online_slots() -> None:
+            @ui.refreshable
+            def render_online_slots() -> None:
                 with session_scope() as session:
-                    for slot, widget in slot_inputs.items():
-                        item = session.exec(select(AppSetting).where(AppSetting.key == f"online_slot_{slot}_label")).first()
-                        if item is None:
-                            item = AppSetting(key=f"online_slot_{slot}_label", value=widget.value)
-                        else:
-                            item.value = widget.value
-                        session.add(item)
-                    session.commit()
-                ui.notify(tr("settings.saved"), color="positive")
+                    rows = session.exec(select(OnlineSlot).order_by(OnlineSlot.order_index, OnlineSlot.id)).all()
+                if not rows:
+                    ui.label(tr("settings.online_slots_empty")).classes("text-sm text-[#6b7280]")
+                for slot in rows:
+                    with ui.card().classes("panel-card p-3 w-full mt-2"):
+                        with ui.row().classes("form-grid"):
+                            label_input = ui.input(tr("settings.slot_label"), value=slot.label)
+                            day_input = ui.select({3: tr("day.wednesday"), 4: tr("day.thursday"), 5: tr("day.friday")}, value=slot.day_of_week, label=tr("editor.change_day"))
+                            start_input = ui.input(tr("settings.slot_start"), value=slot.start_time)
+                            end_input = ui.input(tr("settings.slot_end"), value=slot.end_time)
+                            order_input = ui.number(tr("settings.slot_order"), value=slot.order_index, min=1, precision=0)
+                            active_input = ui.switch(tr("settings.slot_active"), value=slot.is_active)
+                        ui.button(
+                            tr("common.save"),
+                            on_click=lambda s=slot, li=label_input, di=day_input, sti=start_input, eni=end_input, oi=order_input, ai=active_input: _save_online_slot(
+                                s.id or 0,
+                                str(li.value or "").strip() or tr("online_slot.label", slot=s.id or 1),
+                                int(di.value or 3),
+                                str(sti.value or "").strip(),
+                                str(eni.value or "").strip(),
+                                bool(ai.value),
+                                int(oi.value or 1),
+                            ),
+                        ).props("outline color=dark")
 
-            ui.button(tr("common.save"), on_click=_save_online_slots).props("color=amber-8")
+            def _save_online_slot(slot_id: int, label: str, day_of_week: int, start_time: str, end_time: str, is_active: bool, order_index: int) -> None:
+                with session_scope() as session:
+                    service.upsert_online_slot(
+                        session,
+                        slot_id,
+                        label=label,
+                        day_of_week=day_of_week,
+                        start_time=start_time,
+                        end_time=end_time,
+                        is_active=is_active,
+                        order_index=order_index,
+                    )
+                ui.notify(tr("settings.saved"), color="positive")
+                render_online_slots.refresh()
+
+            def _create_online_slot() -> None:
+                with session_scope() as session:
+                    rows = session.exec(select(OnlineSlot).order_by(OnlineSlot.order_index, OnlineSlot.id)).all()
+                    next_index = (max((row.order_index for row in rows), default=0) or 0) + 1
+                    service.upsert_online_slot(
+                        session,
+                        None,
+                        label=tr("online_slot.label", slot=next_index),
+                        day_of_week=5,
+                        start_time="18:10",
+                        end_time="19:30",
+                        is_active=True,
+                        order_index=next_index,
+                    )
+                ui.notify(tr("settings.online_slot_created"), color="positive")
+                render_online_slots.refresh()
+
+            ui.button(tr("settings.add_online_slot"), on_click=_create_online_slot).props("color=amber-8")
+            render_online_slots()
 
         @ui.refreshable
         def render_subject_policy() -> None:

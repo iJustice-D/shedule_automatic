@@ -13,8 +13,9 @@ from app.core.timetable import (
     pair_time_range,
     shift_label,
 )
-from app.core.week_scope import decode_week_scope
-from app.models import AppSetting, Group, Room, Schedule, ScheduleEntry, Subject, Teacher
+from app.core.week_scope import format_week_scope
+from app.models import Group, OnlineSlot, Room, Schedule, ScheduleEntry, Subject, Teacher
+from app.services.weekly_workload import WeeklyWorkloadService
 
 
 def build_schedule_context(session: Session, schedule_id: int) -> dict:
@@ -26,11 +27,15 @@ def build_schedule_context(session: Session, schedule_id: int) -> dict:
     teachers = {teacher.id: teacher for teacher in session.exec(select(Teacher)).all()}
     rooms = {room.id: room for room in session.exec(select(Room)).all()}
     groups = {group.id: group for group in session.exec(select(Group)).all()}
-    settings = {item.key: item.value for item in session.exec(select(AppSetting)).all()}
+    online_slots = {slot.id or 0: slot for slot in session.exec(select(OnlineSlot)).all()}
+    balance_rows = WeeklyWorkloadService.teacher_balance_report(session)
+    unresolved_rows = WeeklyWorkloadService.unresolved_rows(session, semester=schedule.semester)
 
     def online_label(slot_number: int | None) -> str:
         slot = slot_number or 1
-        return settings.get(f"online_slot_{slot}_label") or online_slot_label(slot)
+        if slot in online_slots:
+            return online_slots[slot].label
+        return online_slot_label(slot)
 
     def teacher_name(entry: ScheduleEntry) -> str:
         return teachers[entry.teacher_id].editable_name or teachers[entry.teacher_id].full_name
@@ -39,7 +44,7 @@ def build_schedule_context(session: Session, schedule_id: int) -> dict:
         return rooms[entry.room_id].code if entry.room_id and entry.room_id in rooms else "Без аудитории"
 
     def weeks_text(entry: ScheduleEntry) -> str:
-        return ",".join(str(week) for week in sorted(decode_week_scope(entry.week_scope)))
+        return format_week_scope(entry.week_scope)
 
     def regular_text(entry: ScheduleEntry) -> str:
         return (
@@ -123,6 +128,19 @@ def build_schedule_context(session: Session, schedule_id: int) -> dict:
         "teacher_grids": teacher_grids,
         "group_online_rows": group_online_rows,
         "teacher_online_rows": teacher_online_rows,
+        "teacher_balance_rows": balance_rows,
+        "unresolved_weekly_rows": unresolved_rows,
+        "unresolved_weekly_rows_report": [
+            {
+                "group": groups[row.group_id].code if row.group_id in groups else str(row.group_id),
+                "semester": row.semester,
+                "subject": subjects[row.subject_id].name if row.subject_id in subjects else str(row.subject_id),
+                "subgroup": row.subgroup_code or "",
+                "assignment_state": row.assignment_state,
+                "teacher_names": row.raw_teacher_names or "",
+            }
+            for row in unresolved_rows
+        ],
         "day_labels": {day: day_label(day) for day in DAYS},
         "pair_headers": {
             pair: f"{pair_label(pair)}\n{pair_time_range(pair)}\n{shift_label('morning' if pair <= 3 else 'afternoon')}"

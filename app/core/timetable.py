@@ -49,9 +49,9 @@ SHIFT_VALUES = (SHIFT_MORNING, SHIFT_AFTERNOON)
 LESSON_MODES = (LESSON_MODE_REGULAR, LESSON_MODE_ONLINE)
 ONLINE_ALLOWED_DAYS = (3, 4, 5)
 ONLINE_SLOT_DEFINITIONS: dict[int, dict[str, int | str]] = {
-    1: {"day_of_week": 3, "label": "Онлайн-слот 1"},
-    2: {"day_of_week": 4, "label": "Онлайн-слот 2"},
-    3: {"day_of_week": 5, "label": "Онлайн-слот 3"},
+    1: {"day_of_week": 3, "label": "Онлайн-слот 1", "start": "18:10", "end": "19:30"},
+    2: {"day_of_week": 4, "label": "Онлайн-слот 2", "start": "18:10", "end": "19:30"},
+    3: {"day_of_week": 5, "label": "Онлайн-слот 3", "start": "18:10", "end": "19:30"},
 }
 
 
@@ -118,6 +118,14 @@ def online_slot_label(slot_number: int, lang: str = "ru", custom_label: str | No
     return t("online_slot.label", lang=lang, slot=slot_number)
 
 
+def online_slot_start(slot_number: int) -> str:
+    return str(ONLINE_SLOT_DEFINITIONS[slot_number].get("start", ""))
+
+
+def online_slot_end(slot_number: int) -> str:
+    return str(ONLINE_SLOT_DEFINITIONS[slot_number].get("end", ""))
+
+
 def online_day_allowed(day_of_week: int) -> bool:
     return day_of_week in ONLINE_ALLOWED_DAYS
 
@@ -154,8 +162,8 @@ def apply_timeslot_to_entry(entry: Any) -> None:
             entry.online_slot_number = slot_number or 1
         entry.pair_number = 0
         entry.shift = SHIFT_ONLINE
-        entry.start_time = ""
-        entry.end_time = ""
+        entry.start_time = online_slot_start(entry.online_slot_number)
+        entry.end_time = online_slot_end(entry.online_slot_number)
         return
     entry.lesson_mode = LESSON_MODE_REGULAR
     entry.slot_category = SLOT_CATEGORY_REGULAR
@@ -168,3 +176,20 @@ def apply_timeslot_to_entry(entry: Any) -> None:
     entry.shift = pair_shift(entry.pair_number)
     entry.start_time = pair_start(entry.pair_number)
     entry.end_time = pair_end(entry.pair_number)
+
+
+def time_to_minutes(value: str) -> int:
+    if not value or ":" not in value:
+        return -1
+    hour, minute = value.split(":", 1)
+    return int(hour) * 60 + int(minute)
+
+
+def intervals_overlap(start_a: str, end_a: str, start_b: str, end_b: str) -> bool:
+    left_start = time_to_minutes(start_a)
+    left_end = time_to_minutes(end_a)
+    right_start = time_to_minutes(start_b)
+    right_end = time_to_minutes(end_b)
+    if min(left_start, left_end, right_start, right_end) < 0:
+        return False
+    return left_start < right_end and right_start < left_end

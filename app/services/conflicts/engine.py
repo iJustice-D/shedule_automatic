@@ -11,14 +11,11 @@ from app.core.timetable import (
     DELIVERY_ONLINE,
     LESSON_MODE_ONLINE,
     LESSON_MODE_REGULAR,
-    ONLINE_ALLOWED_DAYS,
     SLOT_CATEGORY_ONLINE_EXTRA,
     SLOT_CATEGORY_REGULAR,
     allowed_pairs_for_shift,
     day_label,
-    online_slot_day,
-    online_slot_matches_day,
-    online_slot_numbers,
+    intervals_overlap,
     online_slot_label,
     pair_label,
     pair_time_range,
@@ -26,29 +23,40 @@ from app.core.timetable import (
     shift_label,
 )
 from app.core.week_scope import decode_week_scope, scopes_overlap
-from app.models import AcademicPeriod, Conflict, CurriculumLoad, Group, GroupSubjectTeacher, Schedule, ScheduleEntry, Subject, Teacher, TeacherSubject
+from app.models import (
+    AcademicPeriod,
+    Conflict,
+    CurriculumLoad,
+    Group,
+    GroupSubjectTeacher,
+    Schedule,
+    ScheduleEntry,
+    Subject,
+    TeacherSubject,
+    WeeklyLoad,
+)
 from app.services.online_policy import OnlinePolicyService
+from app.services.online_slots import OnlineSlotService
 
 
 class ConflictEngine:
     def __init__(self) -> None:
         self.online_policy_service = OnlinePolicyService()
+        self.online_slot_service = OnlineSlotService()
 
     def refresh(self, session: Session, schedule: Schedule) -> list[Conflict]:
         session.exec(delete(Conflict).where(Conflict.schedule_id == schedule.id))
-        entries = session.exec(
-            select(ScheduleEntry).where(ScheduleEntry.schedule_id == schedule.id)
-        ).all()
+        entries = session.exec(select(ScheduleEntry).where(ScheduleEntry.schedule_id == schedule.id)).all()
         conflicts: list[Conflict] = []
-        conflicts.extend(self._detect_slot_conflicts(entries, schedule.id))
-        conflicts.extend(self._detect_teacher_eligibility(session, entries, schedule.id))
-        conflicts.extend(self._detect_blocked_periods(session, entries, schedule.id))
-        conflicts.extend(self._detect_shift_violations(session, entries, schedule.id))
-        conflicts.extend(self._detect_room_requirements(entries, schedule.id))
+        conflicts.extend(self._detect_slot_conflicts(entries, schedule.id or 0))
+        conflicts.extend(self._detect_teacher_eligibility(session, entries, schedule.id or 0))
+        conflicts.extend(self._detect_blocked_periods(session, entries, schedule.id or 0))
+        conflicts.extend(self._detect_shift_violations(session, entries, schedule.id or 0))
+        conflicts.extend(self._detect_room_requirements(entries, schedule.id or 0))
         conflicts.extend(self._detect_unscheduled_load(session, schedule, entries))
-        conflicts.extend(self._detect_online_rules(session, entries, schedule.id))
-        conflicts.extend(self._detect_daily_load(entries, schedule.id))
-        conflicts.extend(self._detect_subject_stacking(entries, schedule.id))
+        conflicts.extend(self._detect_online_rules(session, entries, schedule.id or 0))
+        conflicts.extend(self._detect_daily_load(entries, schedule.id or 0))
+        conflicts.extend(self._detect_subject_stacking(entries, schedule.id or 0))
         for conflict in conflicts:
             session.add(conflict)
         session.commit()
@@ -58,23 +66,16 @@ class ConflictEngine:
         conflicts: list[Conflict] = []
         for index, left in enumerate(entries):
             for right in entries[index + 1 :]:
-                if left.lesson_mode != right.lesson_mode:
-                    continue
                 if left.day_of_week != right.day_of_week:
-                    continue
-                if left.lesson_mode == LESSON_MODE_REGULAR and left.pair_number != right.pair_number:
-                    continue
-                if left.lesson_mode == LESSON_MODE_ONLINE and left.online_slot_number != right.online_slot_number:
                     continue
                 if not scopes_overlap(left.week_scope, right.week_scope):
                     continue
+                if not intervals_overlap(left.start_time, left.end_time, right.start_time, right.end_time):
+                    continue
                 overlap_weeks = sorted(decode_week_scope(left.week_scope) & decode_week_scope(right.week_scope))
                 weeks_text = ", ".join(str(week) for week in overlap_weeks[:10])
-                if left.lesson_mode == LESSON_MODE_ONLINE:
-                    slot_text = f"{day_label(left.day_of_week)}, {online_slot_label(left.online_slot_number or 1)}"
-                else:
-                    slot_text = f"{day_label(left.day_of_week)}, {pair_label(left.pair_number)} ({pair_time_range(left.pair_number)})"
-                if left.group_id == right.group_id:
+                slot_text = self._slot_text(left)
+                if self._group_overlap(left, right):
                     conflicts.append(
                         Conflict(
                             schedule_id=schedule_id,
@@ -86,17 +87,20 @@ class ConflictEngine:
                         )
                     )
                 if left.teacher_id == right.teacher_id:
+                    message = "Преподаватель назначен на два занятия одновременно"
+                    if left.lesson_mode != right.lesson_mode:
+                        message = "Конфликт онлайн- и очного занятия у преподавателя"
                     conflicts.append(
                         Conflict(
                             schedule_id=schedule_id,
                             type="teacher_double_booked",
                             severity="hard",
                             code="TCH-DBL",
-                            message=f"Преподаватель назначен на два занятия одновременно: {slot_text}. Совпадающие недели: {weeks_text}.",
+                            message=f"{message}: {slot_text}. Совпадающие недели: {weeks_text}.",
                             related_entry_ids=f"{left.id},{right.id}",
                         )
                     )
-                if left.lesson_mode == LESSON_MODE_REGULAR and room_required(left.delivery_mode) and room_required(right.delivery_mode) and left.room_id == right.room_id:
+                if room_required(left.delivery_mode) and room_required(right.delivery_mode) and left.room_id and left.room_id == right.room_id:
                     conflicts.append(
                         Conflict(
                             schedule_id=schedule_id,
@@ -141,7 +145,7 @@ class ConflictEngine:
                     type="teacher_not_allowed",
                     severity="hard",
                     code="TCH-NOT-ALLOWED",
-                    message=f"Преподаватель не назначен на этот предмет для выбранной группы.",
+                    message="Преподаватель не назначен на этот предмет для выбранной группы.",
                     related_entry_ids=str(entry.id),
                     details_json=json.dumps({"allowed_teacher_ids": fixed_teacher_ids}),
                 )
@@ -174,10 +178,7 @@ class ConflictEngine:
                     type="blocked_period",
                     severity="hard",
                     code="BLK-PERIOD",
-                    message=(
-                        "Занятие поставлено на недоступный учебный период: "
-                        + ", ".join(str(period.week_number) for period in blocked)
-                    ),
+                    message="Занятие поставлено на недоступный учебный период: " + ", ".join(str(period.week_number) for period in blocked),
                     related_entry_ids=str(entry.id),
                 )
             )
@@ -185,6 +186,7 @@ class ConflictEngine:
 
     def _detect_shift_violations(self, session: Session, entries: list[ScheduleEntry], schedule_id: int) -> list[Conflict]:
         groups = {group.id: group for group in session.exec(select(Group)).all()}
+        online_slot_map = self.online_slot_service.slot_map(session)
         conflicts: list[Conflict] = []
         for entry in entries:
             group = groups.get(entry.group_id)
@@ -219,7 +221,8 @@ class ConflictEngine:
                     )
                 )
                 continue
-            if entry.slot_category != SLOT_CATEGORY_ONLINE_EXTRA:
+            slot = online_slot_map.get(entry.online_slot_number or 0)
+            if entry.slot_category != SLOT_CATEGORY_ONLINE_EXTRA or slot is None:
                 conflicts.append(
                     Conflict(
                         schedule_id=schedule_id,
@@ -227,6 +230,18 @@ class ConflictEngine:
                         severity="hard",
                         code="ONLINE-SLOT",
                         message="Онлайн-занятия можно ставить только в отдельные онлайн-слоты.",
+                        related_entry_ids=str(entry.id),
+                    )
+                )
+                continue
+            if entry.day_of_week != slot.day_of_week:
+                conflicts.append(
+                    Conflict(
+                        schedule_id=schedule_id,
+                        type="online_day_violation",
+                        severity="hard",
+                        code="ONLINE-DAY-RULE",
+                        message="Онлайн-занятия доступны только в среду, четверг и пятницу.",
                         related_entry_ids=str(entry.id),
                     )
                 )
@@ -254,12 +269,32 @@ class ConflictEngine:
         schedule: Schedule,
         entries: list[ScheduleEntry],
     ) -> list[Conflict]:
-        loads = session.exec(select(CurriculumLoad).where(CurriculumLoad.semester == schedule.semester)).all()
-        target_group_ids = {entry.group_id for entry in entries}
-        relevant_loads = [load for load in loads if load.group_id in target_group_ids]
-        grouped_entries: dict[tuple[int, int], list[ScheduleEntry]] = defaultdict(list)
+        relevant_group_ids = self._schedule_group_ids(session, schedule)
         subjects = {subject.id: subject for subject in session.exec(select(Subject)).all()}
         groups = {group.id: group for group in session.exec(select(Group)).all()}
+        grouped_entries: dict[tuple[int, int, str], list[ScheduleEntry]] = defaultdict(list)
+        for entry in entries:
+            grouped_entries[(entry.group_id, entry.subject_id, entry.subgroup_code or "")].append(entry)
+
+        weekly_query = select(WeeklyLoad).where(
+            WeeklyLoad.is_active.is_(True),
+            WeeklyLoad.semester == schedule.semester,
+            WeeklyLoad.load_category == "regular",
+            WeeklyLoad.is_facultative.is_(False),
+            WeeklyLoad.is_practice.is_(False),
+        )
+        if relevant_group_ids:
+            weekly_query = weekly_query.where(WeeklyLoad.group_id.in_(relevant_group_ids))
+        weekly_rows = session.exec(weekly_query).all()
+        if weekly_rows:
+            return self._weekly_unscheduled_conflicts(session, schedule, entries, weekly_rows, grouped_entries, subjects, groups)
+
+        load_query = select(CurriculumLoad).where(CurriculumLoad.semester == schedule.semester)
+        if relevant_group_ids:
+            load_query = load_query.where(CurriculumLoad.group_id.in_(relevant_group_ids))
+        loads = session.exec(load_query).all()
+        relevant_loads = [load for load in loads if not relevant_group_ids or load.group_id in relevant_group_ids]
+        conflicts: list[Conflict] = []
         study_weeks_by_group = {
             group_id: len(
                 session.exec(
@@ -275,13 +310,10 @@ class ConflictEngine:
         expected_pairs_by_group: dict[int, int] = defaultdict(int)
         for load in relevant_loads:
             expected_pairs_by_group[load.group_id] += max(int(round(load.total_hours / 2)), 1)
-        conflicts: list[Conflict] = []
-        for entry in entries:
-            grouped_entries[(entry.group_id, entry.subject_id)].append(entry)
         for load in relevant_loads:
             scheduled_pairs = sum(
                 len(decode_week_scope(entry.week_scope))
-                for entry in grouped_entries.get((load.group_id, load.subject_id), [])
+                for entry in grouped_entries.get((load.group_id, load.subject_id, ""), [])
             )
             expected_pairs = max(int(round(load.total_hours / 2)), 1)
             if scheduled_pairs >= expected_pairs:
@@ -308,17 +340,14 @@ class ConflictEngine:
             if not teacher_allowed:
                 reason_parts.append("не назначен допустимый преподаватель")
             if group is not None and study_weeks:
-                regular_capacity = study_weeks * len(DAYS) * len(allowed_pairs_for_shift(group.shift))
-                online_capacity = study_weeks * len(online_slot_numbers())
-                capacity = regular_capacity + online_capacity
-                expected_group_pairs = expected_pairs_by_group.get(load.group_id, 0)
-                if expected_group_pairs > capacity:
+                capacity = study_weeks * (len(DAYS) * len(allowed_pairs_for_shift(group.shift)) + len(self.online_slot_service.active_slots(session)))
+                if expected_pairs_by_group.get(load.group_id, 0) > capacity:
                     reason_parts.append(
-                        f"суммарная нагрузка группы ({expected_group_pairs} пар) превышает общую вместимость основного и онлайн-слотов ({capacity} пар)"
+                        f"суммарная нагрузка группы ({expected_pairs_by_group.get(load.group_id, 0)} пар) превышает общую вместимость основного и онлайн-слотов ({capacity} пар)"
                     )
             related_ids = ",".join(
                 str(entry.id)
-                for entry in grouped_entries.get((load.group_id, load.subject_id), [])
+                for entry in grouped_entries.get((load.group_id, load.subject_id, ""), [])
                 if entry.id is not None
             )
             message = (
@@ -349,6 +378,88 @@ class ConflictEngine:
             )
         return conflicts
 
+    def _weekly_unscheduled_conflicts(
+        self,
+        session: Session,
+        schedule: Schedule,
+        entries: list[ScheduleEntry],
+        rows: list[WeeklyLoad],
+        grouped_entries: dict[tuple[int, int, str], list[ScheduleEntry]],
+        subjects: dict[int, Subject],
+        groups: dict[int, Group],
+    ) -> list[Conflict]:
+        conflicts: list[Conflict] = []
+        study_weeks_by_group: dict[int, int] = {}
+        expected_pairs_by_group: dict[int, int] = defaultdict(int)
+        relevant_group_ids = {entry.group_id for entry in entries} or {row.group_id for row in rows}
+        online_slot_count = len(self.online_slot_service.active_slots(session))
+        for row in rows:
+            if row.group_id not in relevant_group_ids:
+                continue
+            study_weeks = row.study_weeks or len(
+                session.exec(
+                    select(AcademicPeriod).where(
+                        AcademicPeriod.group_id == row.group_id,
+                        AcademicPeriod.semester == schedule.semester,
+                        AcademicPeriod.is_schedulable.is_(True),
+                    )
+                ).all()
+            )
+            study_weeks_by_group[row.group_id] = max(study_weeks_by_group.get(row.group_id, 0), study_weeks)
+            expected_pairs = max(int(round(row.total_hours / 2)), int(round((row.weekly_pairs or 0) * max(study_weeks, 1))), 1)
+            expected_pairs_by_group[row.group_id] += expected_pairs
+            key = (row.group_id, row.subject_id, row.subgroup_code or "")
+            scheduled_pairs = sum(len(decode_week_scope(entry.week_scope)) for entry in grouped_entries.get(key, []))
+            if scheduled_pairs >= expected_pairs:
+                continue
+            missing_pairs = expected_pairs - scheduled_pairs
+            group = groups.get(row.group_id)
+            subject = subjects.get(row.subject_id)
+            reason_parts: list[str] = []
+            if study_weeks <= 0:
+                reason_parts.append("для семестра не заданы учебные недели")
+            if row.assignment_state in {"vacancy", "unresolved_manual_review"} and not row.candidate_teacher_ids and not row.fixed_teacher_id:
+                reason_parts.append("для этой нагрузки не назначен преподаватель")
+            if row.assignment_state == "multi_teacher":
+                reason_parts.append("по строке задано несколько преподавателей, требуется уточнение")
+            if group is not None and study_weeks:
+                capacity = study_weeks * (len(DAYS) * len(allowed_pairs_for_shift(group.shift)) + online_slot_count)
+                if expected_pairs_by_group[row.group_id] > capacity:
+                    reason_parts.append(
+                        f"суммарная нагрузка группы ({expected_pairs_by_group[row.group_id]} пар) превышает общую вместимость основного и онлайн-слотов ({capacity} пар)"
+                    )
+            subgroup_text = f", подгруппа {row.subgroup_code}" if row.subgroup_code else ""
+            related_ids = ",".join(str(entry.id) for entry in grouped_entries.get(key, []) if entry.id is not None)
+            message = (
+                f"Не удалось разместить всю нагрузку по предмету "
+                f"\"{subject.name if subject else row.subject_id}\" для группы "
+                f"{group.code if group else row.group_id}{subgroup_text}: не хватает {missing_pairs} пар."
+            )
+            if reason_parts:
+                message += " Причина: " + "; ".join(reason_parts) + "."
+            conflicts.append(
+                Conflict(
+                    schedule_id=schedule.id or 0,
+                    type="unscheduled_load",
+                    severity="hard",
+                    code="LOAD-MISSING",
+                    message=message,
+                    related_entry_ids=related_ids,
+                    details_json=json.dumps(
+                        {
+                            "group_id": row.group_id,
+                            "subject_id": row.subject_id,
+                            "subgroup_code": row.subgroup_code,
+                            "expected_pairs": expected_pairs,
+                            "scheduled_pairs": scheduled_pairs,
+                            "missing_pairs": missing_pairs,
+                            "assignment_state": row.assignment_state,
+                        }
+                    ),
+                )
+            )
+        return conflicts
+
     def _detect_online_rules(
         self,
         session: Session,
@@ -358,6 +469,7 @@ class ConflictEngine:
         conflicts: list[Conflict] = []
         groups = {group.id: group for group in session.exec(select(Group)).all()}
         subjects = {subject.id: subject for subject in session.exec(select(Subject)).all()}
+        online_slot_map = self.online_slot_service.slot_map(session)
         grouped_entries: dict[int, list[ScheduleEntry]] = defaultdict(list)
         for entry in entries:
             grouped_entries[entry.group_id].append(entry)
@@ -373,18 +485,8 @@ class ConflictEngine:
                     )
                 )
             if entry.lesson_mode == LESSON_MODE_ONLINE:
-                if entry.day_of_week not in ONLINE_ALLOWED_DAYS:
-                    conflicts.append(
-                        Conflict(
-                            schedule_id=schedule_id,
-                            type="online_day_violation",
-                            severity="hard",
-                            code="ONLINE-DAY-RULE",
-                            message="Онлайн-занятия доступны только в среду, четверг и пятницу.",
-                            related_entry_ids=str(entry.id),
-                        )
-                    )
-                if entry.online_slot_number not in online_slot_numbers() or not online_slot_matches_day(entry.online_slot_number or 0, entry.day_of_week):
+                slot = online_slot_map.get(entry.online_slot_number or 0)
+                if slot is None or not slot.is_active:
                     conflicts.append(
                         Conflict(
                             schedule_id=schedule_id,
@@ -392,6 +494,17 @@ class ConflictEngine:
                             severity="hard",
                             code="ONLINE-SLOT",
                             message="Онлайн-занятия можно ставить только в отдельные онлайн-слоты.",
+                            related_entry_ids=str(entry.id),
+                        )
+                    )
+                elif entry.day_of_week != slot.day_of_week:
+                    conflicts.append(
+                        Conflict(
+                            schedule_id=schedule_id,
+                            type="online_day_violation",
+                            severity="hard",
+                            code="ONLINE-DAY-RULE",
+                            message="Онлайн-занятия доступны только в среду, четверг и пятницу.",
                             related_entry_ids=str(entry.id),
                         )
                     )
@@ -440,7 +553,11 @@ class ConflictEngine:
                         severity="soft",
                         code="ONLINE-DAY",
                         message=f"Слишком много онлайн-занятий в один день: {day_label(day_of_week)} ({count}).",
-                        related_entry_ids=",".join(str(entry.id) for entry in group_entries if entry.day_of_week == day_of_week and entry.lesson_mode == LESSON_MODE_ONLINE),
+                        related_entry_ids=",".join(
+                            str(entry.id)
+                            for entry in group_entries
+                            if entry.day_of_week == day_of_week and entry.lesson_mode == LESSON_MODE_ONLINE
+                        ),
                     )
                 )
         return conflicts
@@ -454,7 +571,7 @@ class ConflictEngine:
             counts[(entry.group_id, entry.day_of_week)] += 1
             related[(entry.group_id, entry.day_of_week)].append(entry.id or 0)
         conflicts: list[Conflict] = []
-        for (group_id, day_of_week), count in counts.items():
+        for (_group_id, day_of_week), count in counts.items():
             if count <= 3:
                 continue
             conflicts.append(
@@ -464,7 +581,7 @@ class ConflictEngine:
                     severity="soft",
                     code="DAY-LOAD",
                     message=f"У группы слишком плотный день: {day_label(day_of_week)}, {count} повторяющихся занятий.",
-                    related_entry_ids=",".join(str(item) for item in related[(group_id, day_of_week)]),
+                    related_entry_ids=",".join(str(item) for item in related[(_group_id, day_of_week)]),
                 )
             )
         return conflicts
@@ -490,6 +607,28 @@ class ConflictEngine:
                 )
             )
         return conflicts
+
+    @staticmethod
+    def _group_overlap(left: ScheduleEntry, right: ScheduleEntry) -> bool:
+        if left.group_id != right.group_id:
+            return False
+        if left.subgroup_code and right.subgroup_code and left.subgroup_code != right.subgroup_code:
+            return False
+        return True
+
+    @staticmethod
+    def _slot_text(entry: ScheduleEntry) -> str:
+        if entry.lesson_mode == LESSON_MODE_ONLINE:
+            return f"{day_label(entry.day_of_week)}, {online_slot_label(entry.online_slot_number or 1)}"
+        return f"{day_label(entry.day_of_week)}, {pair_label(entry.pair_number)} ({pair_time_range(entry.pair_number)})"
+
+    @staticmethod
+    def _schedule_group_ids(session: Session, schedule: Schedule) -> list[int]:
+        codes = [item.strip() for item in (schedule.group_scope or "").split(",") if item.strip()]
+        if codes:
+            return [group.id or 0 for group in session.exec(select(Group).where(Group.code.in_(codes))).all()]
+        rows = session.exec(select(ScheduleEntry.group_id).where(ScheduleEntry.schedule_id == schedule.id).distinct()).all()
+        return [row[0] if isinstance(row, tuple) else int(row) for row in rows]
 
     @staticmethod
     def is_hard(conflict: Conflict) -> bool:

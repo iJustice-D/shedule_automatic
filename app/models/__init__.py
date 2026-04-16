@@ -7,6 +7,7 @@ from app.models.entities import (
     Department,
     Group,
     GroupSubjectTeacher,
+    OnlineSlot,
     OnlinePolicy,
     Room,
     Schedule,
@@ -16,6 +17,7 @@ from app.models.entities import (
     Teacher,
     TeacherSubject,
     Timeslot,
+    WeeklyLoad,
 )
 
 __all__ = [
@@ -27,6 +29,7 @@ __all__ = [
     "Department",
     "Group",
     "GroupSubjectTeacher",
+    "OnlineSlot",
     "OnlinePolicy",
     "Room",
     "Schedule",
@@ -36,4 +39,5 @@ __all__ = [
     "Teacher",
     "TeacherSubject",
     "Timeslot",
+    "WeeklyLoad",
 ]

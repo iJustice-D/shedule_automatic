@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, select
 
 from app.db.session import get_session
-from app.models import AcademicPeriod, AppSetting, Conflict, CurriculumLoad, Group, Room, Schedule, ScheduleEntry, Subject, Suggestion, Teacher
+from app.models import AcademicPeriod, AppSetting, Conflict, CurriculumLoad, Group, OnlineSlot, Room, Schedule, ScheduleEntry, Subject, Suggestion, Teacher, WeeklyLoad
 from app.schemas.api import CalendarPeriodUpdate, EntryUpdate, GenerateRequest, SettingUpdate, TeacherCreate, TeacherRename
 from app.services.timetable_service import TimetableService
 
@@ -97,6 +97,32 @@ def list_curriculum_loads(group_id: int | None = None, semester: int | None = No
     return as_json(session.exec(query).all())
 
 
+@router.get("/weekly-loads")
+def list_weekly_loads(group_id: int | None = None, semester: int | None = None, session: Session = Depends(get_session)):
+    query = select(WeeklyLoad).where(WeeklyLoad.is_active.is_(True)).order_by(WeeklyLoad.group_id, WeeklyLoad.semester, WeeklyLoad.subject_id)
+    if group_id:
+        query = query.where(WeeklyLoad.group_id == group_id)
+    if semester:
+        query = query.where(WeeklyLoad.semester == semester)
+    return as_json(session.exec(query).all())
+
+
+@router.get("/weekly-loads/unresolved")
+def list_unresolved_weekly_loads(semester: int | None = None, session: Session = Depends(get_session)):
+    query = select(WeeklyLoad).where(
+        WeeklyLoad.is_active.is_(True),
+        WeeklyLoad.assignment_state.in_(["vacancy", "candidate_pool", "multi_teacher", "unresolved_manual_review"]),
+    ).order_by(WeeklyLoad.group_id, WeeklyLoad.subject_id)
+    if semester:
+        query = query.where(WeeklyLoad.semester == semester)
+    return as_json(session.exec(query).all())
+
+
+@router.get("/online-slots")
+def list_online_slots(session: Session = Depends(get_session)):
+    return as_json(session.exec(select(OnlineSlot).order_by(OnlineSlot.order_index, OnlineSlot.id)).all())
+
+
 @router.get("/schedules")
 def list_schedules(session: Session = Depends(get_session)):
     return as_json(session.exec(select(Schedule).order_by(Schedule.created_at.desc())).all())
@@ -139,6 +165,20 @@ def list_conflicts(schedule_id: int, session: Session = Depends(get_session)):
     return {
         "conflicts": as_json(conflicts),
         "suggestions": as_json(suggestions),
+    }
+
+
+@router.get("/schedules/{schedule_id}/diagnostics")
+def schedule_diagnostics(schedule_id: int, group_id: int | None = None, session: Session = Depends(get_session)):
+    data = service.result_diagnostics(session, schedule_id, group_id=group_id)
+    return {
+        "summary": data["summary"],
+        "subject_rows": data["subject_rows"],
+        "hard_conflicts": as_json(data["hard_conflicts"]),
+        "unscheduled_conflicts": as_json(data["unscheduled_conflicts"]),
+        "warnings": data["warnings"],
+        "normalization_issues": data["normalization_issues"],
+        "teacher_balance_rows": data["teacher_balance_rows"],
     }
 
 

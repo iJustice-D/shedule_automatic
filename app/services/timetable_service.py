@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 import json
 from pathlib import Path
 
@@ -17,14 +18,34 @@ from app.core.timetable import (
     SHIFT_MORNING,
     SLOT_CATEGORY_ONLINE_EXTRA,
     SLOT_CATEGORY_REGULAR,
+    allowed_pairs_for_shift,
     apply_timeslot_to_entry,
+    intervals_overlap,
     online_slot_matches_day,
     online_slot_numbers,
     pair_allowed_for_shift,
     room_required,
 )
-from app.core.week_scope import scopes_overlap
-from app.models import AppSetting, ChangeLog, Conflict, Group, GroupSubjectTeacher, OnlinePolicy, Room, Schedule, ScheduleEntry, Subject, Suggestion, Teacher, TeacherSubject
+from app.core.week_scope import decode_week_scope, scopes_overlap
+from app.models import (
+    AcademicPeriod,
+    AppSetting,
+    ChangeLog,
+    Conflict,
+    CurriculumLoad,
+    Group,
+    GroupSubjectTeacher,
+    OnlineSlot,
+    OnlinePolicy,
+    Room,
+    Schedule,
+    ScheduleEntry,
+    Subject,
+    Suggestion,
+    Teacher,
+    TeacherSubject,
+    WeeklyLoad,
+)
 from app.services.ai.dummy import DummyExplanationProvider
 from app.services.ai.gemini_provider import GeminiExplanationProvider
 from app.services.conflicts.engine import ConflictEngine
@@ -33,19 +54,23 @@ from app.services.exporters.docx_exporter import DocxExporter
 from app.services.exporters.pdf_exporter import PdfExporter
 from app.services.exporters.xlsx_exporter import XlsxExporter
 from app.services.online_policy import OnlinePolicyService
-from app.services.scheduler.generator import GreedyScheduleGenerator
+from app.services.online_slots import OnlineSlotService
+from app.services.scheduler.generator import HybridScheduleGenerator
 from app.services.suggestions.engine import SuggestionEngine
+from app.services.weekly_workload import WeeklyWorkloadService
 
 
 class TimetableService:
     def __init__(self) -> None:
-        self.generator = GreedyScheduleGenerator()
+        self.generator = HybridScheduleGenerator()
         self.conflict_engine = ConflictEngine()
         self.suggestion_engine = SuggestionEngine()
         self.xlsx_exporter = XlsxExporter()
         self.pdf_exporter = PdfExporter()
         self.docx_exporter = DocxExporter()
         self.online_policy_service = OnlinePolicyService()
+        self.online_slot_service = OnlineSlotService()
+        self.weekly_workload_service = WeeklyWorkloadService()
 
     def generate_schedule(
         self,
@@ -72,6 +97,7 @@ class TimetableService:
             raise ValueError("Запись расписания не найдена.")
         group = session.get(Group, entry.group_id)
         before = entry.model_dump()
+        requested_day_of_week = payload.get("day_of_week")
         if payload.get("rename_teacher_to"):
             teacher = session.get(Teacher, entry.teacher_id)
             teacher.editable_name = payload["rename_teacher_to"]
@@ -136,7 +162,9 @@ class TimetableService:
             if entry.delivery_mode == DELIVERY_ONLINE:
                 entry.delivery_mode = DELIVERY_OFFLINE
         apply_timeslot_to_entry(entry)
-        self._validate_slot_rules(group, entry)
+        if entry.lesson_mode == LESSON_MODE_ONLINE:
+            self.online_slot_service.apply_to_entry(session, entry)
+        self._validate_slot_rules(session, group, entry, requested_day_of_week=requested_day_of_week)
         if entry.lesson_mode == LESSON_MODE_REGULAR and room_required(entry.delivery_mode) and entry.room_id is None and payload.get("room_id") is None:
             available_room = self._find_available_room(session, entry)
             entry.room_id = available_room.id if available_room else None
@@ -183,6 +211,105 @@ class TimetableService:
         session.commit()
         session.refresh(teacher)
         return teacher
+
+    def create_group(self, session: Session, payload: dict) -> Group:
+        self._validate_group_payload(session, payload)
+        existing = session.exec(select(Group).where(Group.code == payload["code"])).first()
+        if existing is not None:
+            raise ValueError("Группа с таким кодом уже существует.")
+        group = Group(**payload)
+        session.add(group)
+        session.commit()
+        session.refresh(group)
+        return group
+
+    def update_group(self, session: Session, group_id: int, payload: dict) -> Group:
+        group = session.get(Group, group_id)
+        if group is None:
+            raise ValueError("Группа не найдена.")
+        self._validate_group_payload(session, payload, current_group_id=group_id)
+        for key, value in payload.items():
+            setattr(group, key, value)
+        session.add(group)
+        session.commit()
+        session.refresh(group)
+        return group
+
+    def delete_group(self, session: Session, group_id: int) -> None:
+        group = session.get(Group, group_id)
+        if group is None:
+            raise ValueError("Группа не найдена.")
+        if session.exec(select(CurriculumLoad).where(CurriculumLoad.group_id == group_id)).first() is not None:
+            raise ValueError("Нельзя удалить группу, пока для нее есть учебная нагрузка.")
+        if session.exec(select(WeeklyLoad).where(WeeklyLoad.group_id == group_id, WeeklyLoad.is_active.is_(True))).first() is not None:
+            raise ValueError("Нельзя удалить группу, пока для нее есть импортированная недельная нагрузка.")
+        if session.exec(select(ScheduleEntry).where(ScheduleEntry.group_id == group_id)).first() is not None:
+            raise ValueError("Нельзя удалить группу, пока она используется в расписании.")
+        session.delete(group)
+        session.commit()
+
+    def create_subject(self, session: Session, payload: dict) -> Subject:
+        self._validate_subject_payload(session, payload)
+        existing = session.exec(select(Subject).where(Subject.code == payload["code"])).first()
+        if existing is not None:
+            raise ValueError("Предмет с таким кодом уже существует.")
+        subject = Subject(**payload)
+        session.add(subject)
+        session.commit()
+        session.refresh(subject)
+        return subject
+
+    def update_subject(self, session: Session, subject_id: int, payload: dict) -> Subject:
+        subject = session.get(Subject, subject_id)
+        if subject is None:
+            raise ValueError("Предмет не найден.")
+        self._validate_subject_payload(session, payload, current_subject_id=subject_id)
+        for key, value in payload.items():
+            setattr(subject, key, value)
+        session.add(subject)
+        session.commit()
+        session.refresh(subject)
+        return subject
+
+    def delete_subject(self, session: Session, subject_id: int) -> None:
+        subject = session.get(Subject, subject_id)
+        if subject is None:
+            raise ValueError("Предмет не найден.")
+        if session.exec(select(CurriculumLoad).where(CurriculumLoad.subject_id == subject_id)).first() is not None:
+            raise ValueError("Нельзя удалить предмет, пока для него есть учебная нагрузка.")
+        if session.exec(select(WeeklyLoad).where(WeeklyLoad.subject_id == subject_id, WeeklyLoad.is_active.is_(True))).first() is not None:
+            raise ValueError("Нельзя удалить предмет, пока для него есть импортированная недельная нагрузка.")
+        if session.exec(select(ScheduleEntry).where(ScheduleEntry.subject_id == subject_id)).first() is not None:
+            raise ValueError("Нельзя удалить предмет, пока он используется в расписании.")
+        session.delete(subject)
+        session.commit()
+
+    def create_curriculum_load(self, session: Session, payload: dict) -> CurriculumLoad:
+        self._validate_load_payload(payload)
+        load = CurriculumLoad(**payload)
+        session.add(load)
+        session.commit()
+        session.refresh(load)
+        return load
+
+    def update_curriculum_load(self, session: Session, load_id: int, payload: dict) -> CurriculumLoad:
+        load = session.get(CurriculumLoad, load_id)
+        if load is None:
+            raise ValueError("Запись учебной нагрузки не найдена.")
+        self._validate_load_payload(payload)
+        for key, value in payload.items():
+            setattr(load, key, value)
+        session.add(load)
+        session.commit()
+        session.refresh(load)
+        return load
+
+    def delete_curriculum_load(self, session: Session, load_id: int) -> None:
+        load = session.get(CurriculumLoad, load_id)
+        if load is None:
+            raise ValueError("Запись учебной нагрузки не найдена.")
+        session.delete(load)
+        session.commit()
 
     def export_schedule(self, session: Session, schedule_id: int, export_format: str) -> Path:
         schedule = session.get(Schedule, schedule_id)
@@ -240,6 +367,364 @@ class TimetableService:
             note=note,
         )
 
+    def import_weekly_workload(
+        self,
+        session: Session,
+        docx_path: Path,
+        calendar_path: Path | None = None,
+        curriculum_path: Path | None = None,
+        group_codes: list[str] | None = None,
+    ) -> list[WeeklyLoad]:
+        if not docx_path.exists():
+            raise ValueError("Файл недельной нагрузки не найден.")
+        return self.weekly_workload_service.import_docx(
+            session,
+            docx_path,
+            calendar_path=calendar_path,
+            curriculum_path=curriculum_path,
+            target_group_codes=group_codes,
+        )
+
+    def teacher_balance_report(self, session: Session) -> list[dict[str, object]]:
+        return self.weekly_workload_service.teacher_balance_report(session)
+
+    def unresolved_weekly_rows(self, session: Session, semester: int | None = None) -> list[WeeklyLoad]:
+        return self.weekly_workload_service.unresolved_rows(session, semester=semester)
+
+    def result_diagnostics(self, session: Session, schedule_id: int, group_id: int | None = None) -> dict[str, object]:
+        schedule = session.get(Schedule, schedule_id)
+        if schedule is None:
+            raise ValueError("Расписание не найдено.")
+        scoped_group_ids = self._schedule_group_ids(session, schedule)
+        if group_id is not None:
+            scoped_group_ids = [group_id]
+        entries_query = select(ScheduleEntry).where(ScheduleEntry.schedule_id == schedule_id)
+        if scoped_group_ids:
+            entries_query = entries_query.where(ScheduleEntry.group_id.in_(scoped_group_ids))
+        entries = session.exec(entries_query).all()
+        entry_map = {entry.id or 0: entry for entry in entries}
+        group_map = {group.id: group for group in session.exec(select(Group)).all()}
+        subject_map = {subject.id: subject for subject in session.exec(select(Subject)).all()}
+
+        conflicts = session.exec(select(Conflict).where(Conflict.schedule_id == schedule_id)).all()
+        scoped_conflicts = [
+            conflict
+            for conflict in conflicts
+            if self._conflict_matches_groups(conflict, scoped_group_ids, entry_map)
+        ]
+        hard_conflicts = [
+            conflict
+            for conflict in scoped_conflicts
+            if conflict.type != "unscheduled_load" and conflict.severity == "hard"
+        ]
+        unscheduled_conflicts = [conflict for conflict in scoped_conflicts if conflict.type == "unscheduled_load"]
+        warning_conflicts = [conflict for conflict in scoped_conflicts if conflict.severity != "hard"]
+
+        expected_rows = self._expected_subject_rows(session, schedule.semester, scoped_group_ids)
+        grouped_entries: dict[tuple[int, int, str], list[ScheduleEntry]] = defaultdict(list)
+        for entry in entries:
+            grouped_entries[(entry.group_id, entry.subject_id, entry.subgroup_code or "")].append(entry)
+
+        regular_capacities = self._group_regular_capacity(session, scoped_group_ids, schedule.semester)
+        online_targets = {group_id_: self.online_policy_service.get_target_for_group(session, group_map[group_id_]) for group_id_ in scoped_group_ids if group_id_ in group_map}
+        online_counts = defaultdict(int)
+        for entry in entries:
+            if entry.lesson_mode == LESSON_MODE_ONLINE:
+                online_counts[entry.group_id] += 1
+
+        subject_rows: list[dict[str, object]] = []
+        normalization_issues: list[dict[str, object]] = []
+        summary = {
+            "selected_group": group_map[scoped_group_ids[0]].code if len(scoped_group_ids) == 1 and scoped_group_ids[0] in group_map else "Несколько групп",
+            "selected_semester": schedule.semester,
+            "expected_subjects_count": 0,
+            "fully_placed_subjects_count": 0,
+            "partially_placed_subjects_count": 0,
+            "not_placed_subjects_count": 0,
+            "total_missing_pairs": 0,
+            "hard_conflicts_count": len(hard_conflicts),
+            "unscheduled_count": len(unscheduled_conflicts),
+            "warnings_count": len(warning_conflicts),
+            "unresolved_teacher_rows_count": 0,
+            "online_placed_count": sum(online_counts.values()),
+            "online_missing_count": 0,
+            "teachers_with_balance_issue_count": 0,
+        }
+
+        for row in expected_rows:
+            key = (row["group_id"], row["subject_id"], row["subgroup_code"])
+            placed_pairs = sum(len(decode_week_scope(entry.week_scope)) for entry in grouped_entries.get(key, []))
+            expected_pairs = int(row["expected_pairs"])
+            missing_pairs = max(expected_pairs - placed_pairs, 0)
+            status = "Полностью размещено"
+            reason = ""
+            if row["excluded_status"]:
+                status = str(row["excluded_status"])
+                reason = str(row["reason"])
+                placed_pairs = 0
+                missing_pairs = expected_pairs
+            elif missing_pairs and row["assignment_state"] in {"vacancy", "unresolved_manual_review", "multi_teacher", "candidate_pool"}:
+                status = "Требуется уточнение преподавателя"
+                reason = self._row_reason(row, regular_capacities)
+            elif missing_pairs and placed_pairs:
+                status = "Частично размещено"
+                reason = self._row_reason(row, regular_capacities)
+            elif missing_pairs:
+                status = "Не размещено"
+                reason = self._row_reason(row, regular_capacities)
+
+            subject_rows.append(
+                {
+                    "group_id": row["group_id"],
+                    "subject_id": row["subject_id"],
+                    "subject": row["subject_label"],
+                    "expected_pairs": expected_pairs,
+                    "placed_pairs": placed_pairs,
+                    "missing_pairs": missing_pairs,
+                    "status": status,
+                    "reason": reason,
+                    "assignment_state": row["assignment_state"],
+                    "is_excluded": bool(row["excluded_status"]),
+                }
+            )
+            summary["expected_subjects_count"] += 1
+            if status == "Полностью размещено":
+                summary["fully_placed_subjects_count"] += 1
+            elif status == "Частично размещено":
+                summary["partially_placed_subjects_count"] += 1
+                summary["total_missing_pairs"] += missing_pairs
+            elif status in {"Не размещено", "Требуется уточнение преподавателя", "Требуется уточнение подгруппы"}:
+                summary["not_placed_subjects_count"] += 1
+                summary["total_missing_pairs"] += missing_pairs
+
+            if row["assignment_state"] in {"vacancy", "unresolved_manual_review", "multi_teacher", "candidate_pool"}:
+                summary["unresolved_teacher_rows_count"] += 1
+                normalization_issues.append(
+                    {
+                        "subject": row["subject_label"],
+                        "state": row["assignment_state"],
+                        "message": self._normalization_message(row),
+                    }
+                )
+
+        relevant_teacher_ids = {
+            row["teacher_id"]
+            for row in self._group_teacher_links(session, scoped_group_ids, schedule.semester)
+            if row["teacher_id"]
+        }
+        balance_rows = [
+            item
+            for item in self.teacher_balance_report(session)
+            if item["teacher_id"] in relevant_teacher_ids
+        ]
+        balance_warnings = [
+            {
+                "teacher_name": item["teacher_name"],
+                "message": (
+                    f"Баланс нагрузки преподавателя нарушен: семестр 3 = {item['semester_3_pairs']} пар, "
+                    f"семестр 4 = {item['semester_4_pairs']} пар."
+                ),
+                "score": item["normalized_balance_score"],
+            }
+            for item in balance_rows
+            if float(item["normalized_balance_score"]) >= 2.0
+        ]
+        summary["teachers_with_balance_issue_count"] = len(balance_warnings)
+        warning_items: list[dict[str, object]] = [{"type": conflict.type, "message": conflict.message, "conflict": conflict} for conflict in warning_conflicts]
+        warning_items.extend(
+            {"type": "teacher_balance", "message": item["message"], "score": item["score"]}
+            for item in balance_warnings
+        )
+        summary["warnings_count"] = len(warning_items)
+
+        if scoped_group_ids:
+            summary["online_missing_count"] = sum(
+                max(online_targets.get(group_id_, 0) - online_counts.get(group_id_, 0), 0)
+                for group_id_ in scoped_group_ids
+            )
+
+        return {
+            "schedule": schedule,
+            "entries": entries,
+            "summary": summary,
+            "subject_rows": sorted(subject_rows, key=lambda item: (item["status"] != "Не размещено", item["subject"])),
+            "hard_conflicts": hard_conflicts,
+            "unscheduled_conflicts": unscheduled_conflicts,
+            "warnings": warning_items,
+            "normalization_issues": normalization_issues,
+            "teacher_balance_rows": balance_rows,
+        }
+
+    def upsert_online_slot(
+        self,
+        session: Session,
+        slot_id: int | None,
+        *,
+        label: str,
+        day_of_week: int,
+        start_time: str,
+        end_time: str,
+        is_active: bool,
+        order_index: int,
+    ) -> OnlineSlot:
+        slot = session.get(OnlineSlot, slot_id) if slot_id else None
+        if slot is None:
+            slot = OnlineSlot(
+                label=label,
+                day_of_week=day_of_week,
+                start_time=start_time,
+                end_time=end_time,
+                is_active=is_active,
+                order_index=order_index,
+            )
+        else:
+            slot.label = label
+            slot.day_of_week = day_of_week
+            slot.start_time = start_time
+            slot.end_time = end_time
+            slot.is_active = is_active
+            slot.order_index = order_index
+        session.add(slot)
+        session.commit()
+        session.refresh(slot)
+        return slot
+
+    def _expected_subject_rows(self, session: Session, semester: int, group_ids: list[int]) -> list[dict[str, object]]:
+        subject_map = {subject.id: subject for subject in session.exec(select(Subject)).all()}
+        rows: list[dict[str, object]] = []
+        weekly_rows = self.weekly_workload_service.active_rows(session, semester=semester, group_ids=group_ids)
+        if weekly_rows:
+            for row in weekly_rows:
+                subject = subject_map.get(row.subject_id)
+                excluded_status = ""
+                reason = ""
+                if row.is_practice or row.load_category in {"practice", "study_practice", "industrial_practice"}:
+                    excluded_status = "Исключено из обычной сетки как практика"
+                    reason = "Практика учитывается отдельно и не попадает в обычную сетку пар."
+                elif row.is_facultative:
+                    excluded_status = "Исключено как факультатив (если не включено)"
+                    reason = "Факультатив не включен в обычную генерацию по умолчанию."
+                rows.append(
+                    {
+                        "group_id": row.group_id,
+                        "subject_id": row.subject_id,
+                        "subject_label": f"{subject.name if subject else row.subject_id}{f' (подгруппа {row.subgroup_code})' if row.subgroup_code else ''}",
+                        "subgroup_code": row.subgroup_code or "",
+                        "expected_pairs": self._expected_pairs_from_weekly(row),
+                        "assignment_state": row.assignment_state,
+                        "excluded_status": excluded_status,
+                        "reason": reason,
+                    }
+                )
+            return rows
+
+        curriculum_rows = session.exec(
+            select(CurriculumLoad).where(
+                CurriculumLoad.semester == semester,
+                CurriculumLoad.group_id.in_(group_ids),
+            )
+        ).all()
+        for row in curriculum_rows:
+            subject = subject_map.get(row.subject_id)
+            rows.append(
+                {
+                    "group_id": row.group_id,
+                    "subject_id": row.subject_id,
+                    "subject_label": subject.name if subject else str(row.subject_id),
+                    "subgroup_code": "",
+                    "expected_pairs": max(int(round(row.total_hours / 2)), 1),
+                    "assignment_state": "manual",
+                    "excluded_status": "",
+                    "reason": "",
+                }
+            )
+        return rows
+
+    @staticmethod
+    def _expected_pairs_from_weekly(row: WeeklyLoad) -> int:
+        weeks = max(int(row.study_weeks or 0), 1)
+        if row.total_hours > 0:
+            return max(int(round(row.total_hours / 2)), 1)
+        if row.weekly_pairs > 0:
+            return max(int(round(row.weekly_pairs * weeks)), 1)
+        return 0
+
+    def _group_regular_capacity(self, session: Session, group_ids: list[int], semester: int) -> dict[int, int]:
+        groups = {group.id: group for group in session.exec(select(Group).where(Group.id.in_(group_ids))).all()} if group_ids else {}
+        online_slot_count = len(self.online_slot_service.active_slots(session))
+        result: dict[int, int] = {}
+        for group_id in group_ids:
+            group = groups.get(group_id)
+            if group is None:
+                continue
+            study_weeks = len(
+                session.exec(
+                    select(AcademicPeriod).where(
+                        AcademicPeriod.group_id == group_id,
+                        AcademicPeriod.semester == semester,
+                        AcademicPeriod.is_schedulable.is_(True),
+                    )
+                ).all()
+            )
+            result[group_id] = study_weeks * (len(allowed_pairs_for_shift(group.shift)) * 5 + online_slot_count)
+        return result
+
+    def _row_reason(self, row: dict[str, object], regular_capacities: dict[int, int]) -> str:
+        assignment_state = str(row["assignment_state"])
+        if assignment_state == "vacancy":
+            return "Для этой нагрузки не назначен преподаватель."
+        if assignment_state == "multi_teacher":
+            return "В исходной строке указано несколько преподавателей, требуется уточнение."
+        if assignment_state in {"unresolved_manual_review", "candidate_pool"}:
+            return "Строка требует ручной проверки закрепления преподавателя."
+        if regular_capacities.get(int(row["group_id"]), 0) <= 0:
+            return "Для группы не найдено учебных недель или доступной вместимости."
+        return "Не хватило доступных слотов без нарушения жёстких ограничений."
+
+    @staticmethod
+    def _normalization_message(row: dict[str, object]) -> str:
+        assignment_state = str(row["assignment_state"])
+        if assignment_state == "vacancy":
+            return f"По предмету «{row['subject_label']}» в исходном файле указана вакансия."
+        if assignment_state == "multi_teacher":
+            return f"По предмету «{row['subject_label']}» найдено несколько преподавателей в одной строке."
+        return f"По предмету «{row['subject_label']}» требуется ручная проверка нормализации."
+
+    def _group_teacher_links(self, session: Session, group_ids: list[int], semester: int) -> list[dict[str, int]]:
+        rows = self.weekly_workload_service.active_rows(session, semester=semester, group_ids=group_ids)
+        result: list[dict[str, int]] = []
+        for row in rows:
+            teacher_id = row.resolved_teacher_id or row.fixed_teacher_id
+            if teacher_id:
+                result.append({"teacher_id": teacher_id})
+            for raw_id in (row.candidate_teacher_ids or "").split(","):
+                if raw_id:
+                    result.append({"teacher_id": int(raw_id)})
+        return result
+
+    @staticmethod
+    def _conflict_matches_groups(conflict: Conflict, group_ids: list[int], entry_map: dict[int, ScheduleEntry]) -> bool:
+        if not group_ids:
+            return True
+        details = {}
+        if conflict.details_json:
+            try:
+                details = json.loads(conflict.details_json)
+            except json.JSONDecodeError:
+                details = {}
+        if details.get("group_id") in group_ids:
+            return True
+        related_ids = [int(item) for item in conflict.related_entry_ids.split(",") if item]
+        return any(entry_map.get(entry_id) and entry_map[entry_id].group_id in group_ids for entry_id in related_ids)
+
+    @staticmethod
+    def _schedule_group_ids(session: Session, schedule: Schedule) -> list[int]:
+        codes = [item.strip() for item in (schedule.group_scope or "").split(",") if item.strip()]
+        if codes:
+            return [group.id or 0 for group in session.exec(select(Group).where(Group.code.in_(codes))).all()]
+        rows = session.exec(select(ScheduleEntry.group_id).where(ScheduleEntry.schedule_id == schedule.id).distinct()).all()
+        return [row[0] if isinstance(row, tuple) else int(row) for row in rows]
+
     def _provider(self, session: Session):
         ai_provider = self._setting(session, "ai_provider") or settings.ai_provider
         gemini_api_key = self._setting(session, "gemini_api_key") or settings.gemini_api_key
@@ -247,13 +732,62 @@ class TimetableService:
             return GeminiExplanationProvider(gemini_api_key)
         return DummyExplanationProvider()
 
-    def _validate_slot_rules(self, group: Group | None, entry: ScheduleEntry) -> None:
+    def _validate_group_payload(self, session: Session, payload: dict, current_group_id: int | None = None) -> None:
+        code = (payload.get("code") or "").strip()
+        if not code:
+            raise ValueError("Код группы обязателен.")
+        if int(payload.get("semester") or 0) <= 0:
+            raise ValueError("Нужно указать корректный семестр.")
+        if int(payload.get("student_count") or -1) < 0:
+            raise ValueError("Количество студентов должно быть неотрицательным числом.")
+        if int(payload.get("home_department_id") or 0) <= 0:
+            raise ValueError("Нужно указать отделение группы.")
+        existing = session.exec(select(Group).where(Group.code == code)).first()
+        if existing is not None and existing.id != current_group_id:
+            raise ValueError("Группа с таким кодом уже существует.")
+
+    def _validate_subject_payload(self, session: Session, payload: dict, current_subject_id: int | None = None) -> None:
+        code = (payload.get("code") or "").strip()
+        name = (payload.get("name") or "").strip()
+        if not code or not name:
+            raise ValueError("Нужно указать код и название предмета.")
+        if int(payload.get("owner_department_id") or 0) <= 0:
+            raise ValueError("Нужно указать отделение-владелец предмета.")
+        existing = session.exec(select(Subject).where(Subject.code == code)).first()
+        if existing is not None and existing.id != current_subject_id:
+            raise ValueError("Предмет с таким кодом уже существует.")
+
+    @staticmethod
+    def _validate_load_payload(payload: dict) -> None:
+        if not payload.get("group_id") or not payload.get("subject_id"):
+            raise ValueError("Нужно указать группу и предмет.")
+        if int(payload.get("semester") or 0) <= 0:
+            raise ValueError("Нужно указать корректный семестр.")
+        if int(payload.get("study_weeks") or 0) <= 0:
+            raise ValueError("Учебных недель должно быть больше нуля.")
+        if float(payload.get("hours_per_week") or 0) < 0 or float(payload.get("pairs_per_week") or 0) < 0:
+            raise ValueError("Часов и пар в неделю не может быть меньше нуля.")
+        if int(payload.get("total_hours") or 0) < 0:
+            raise ValueError("Всего часов не может быть меньше нуля.")
+
+    def _validate_slot_rules(
+        self,
+        session: Session,
+        group: Group | None,
+        entry: ScheduleEntry,
+        requested_day_of_week: int | None = None,
+    ) -> None:
         if entry.lesson_mode == LESSON_MODE_ONLINE:
             if entry.slot_category != SLOT_CATEGORY_ONLINE_EXTRA or entry.pair_number != 0:
                 raise ValueError("Онлайн-занятия можно ставить только в отдельные онлайн-слоты.")
-            if entry.day_of_week not in ONLINE_ALLOWED_DAYS:
+            if requested_day_of_week is not None and requested_day_of_week not in ONLINE_ALLOWED_DAYS:
                 raise ValueError("Онлайн-занятия доступны только в среду, четверг и пятницу.")
-            if entry.online_slot_number not in online_slot_numbers() or not online_slot_matches_day(entry.online_slot_number or 0, entry.day_of_week):
+            slot = self.online_slot_service.slot_map(session).get(entry.online_slot_number or 0)
+            if slot is None or not slot.is_active:
+                raise ValueError("Онлайн-занятия можно ставить только в отдельные онлайн-слоты.")
+            if requested_day_of_week is not None and requested_day_of_week != slot.day_of_week:
+                raise ValueError("Онлайн-занятия можно ставить только в отдельные онлайн-слоты.")
+            if entry.day_of_week != slot.day_of_week or entry.day_of_week not in ONLINE_ALLOWED_DAYS:
                 raise ValueError("Онлайн-занятия можно ставить только в отдельные онлайн-слоты.")
             return
         if entry.slot_category != SLOT_CATEGORY_REGULAR:
@@ -295,21 +829,25 @@ class TimetableService:
             )
         ).all()
         for other in others:
-            if other.lesson_mode != entry.lesson_mode:
-                continue
             if other.day_of_week != entry.day_of_week:
-                continue
-            if entry.lesson_mode == LESSON_MODE_REGULAR and other.pair_number != entry.pair_number:
-                continue
-            if entry.lesson_mode == LESSON_MODE_ONLINE and other.online_slot_number != entry.online_slot_number:
                 continue
             if not scopes_overlap(other.week_scope, entry.week_scope):
                 continue
-            if other.group_id == entry.group_id:
+            if not intervals_overlap(other.start_time, other.end_time, entry.start_time, entry.end_time):
+                continue
+            same_group = other.group_id == entry.group_id
+            subgroup_overlap = not (
+                other.subgroup_code
+                and entry.subgroup_code
+                and other.subgroup_code != entry.subgroup_code
+            )
+            if same_group and subgroup_overlap:
                 raise ValueError("Группа уже занята в это время.")
             if other.teacher_id == entry.teacher_id:
+                if other.lesson_mode != entry.lesson_mode:
+                    raise ValueError("Конфликт онлайн- и очного занятия у преподавателя.")
                 raise ValueError("Преподаватель уже занят в это время.")
-            if entry.lesson_mode == LESSON_MODE_REGULAR and room_required(other.delivery_mode) and room_required(entry.delivery_mode):
+            if room_required(other.delivery_mode) and room_required(entry.delivery_mode):
                 if entry.room_id is not None and other.room_id == entry.room_id:
                     raise ValueError("Аудитория уже занята в это время.")
 

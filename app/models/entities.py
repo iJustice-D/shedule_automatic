@@ -66,6 +66,16 @@ class Timeslot(SQLModel, table=True):
     label: str
 
 
+class OnlineSlot(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    label: str
+    day_of_week: int = Field(index=True)
+    start_time: str = ""
+    end_time: str = ""
+    is_active: bool = True
+    order_index: int = 1
+
+
 class AcademicPeriod(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     group_id: int = Field(foreign_key="group.id", index=True)
@@ -89,6 +99,35 @@ class CurriculumLoad(SQLModel, table=True):
     raw_total_hours: int = 0
     practice_hours: int = 0
     source_code: str = ""
+    source_type: str = "imported"
+    note: str = ""
+
+
+class WeeklyLoad(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    group_id: int = Field(foreign_key="group.id", index=True)
+    subject_id: int = Field(foreign_key="subject.id", index=True)
+    semester: int = Field(index=True)
+    source_semester_label: str = ""
+    weekly_hours: float = 0.0
+    weekly_pairs: float = 0.0
+    total_hours: int = 0
+    study_weeks: int = 0
+    load_category: str = "regular"
+    subgroup_code: Optional[str] = None
+    is_facultative: bool = False
+    is_practice: bool = False
+    practice_type: str = ""
+    source_priority: int = 50
+    delivery_mode: str = "offline"
+    source_file: str = ""
+    raw_import_notes: str = ""
+    raw_teacher_names: str = ""
+    candidate_teacher_ids: str = ""
+    assignment_state: str = "unresolved_manual_review"
+    fixed_teacher_id: Optional[int] = Field(default=None, foreign_key="teacher.id", index=True)
+    resolved_teacher_id: Optional[int] = Field(default=None, foreign_key="teacher.id", index=True)
+    is_active: bool = True
 
 
 class TeacherSubject(SQLModel, table=True):
@@ -111,6 +150,7 @@ class Schedule(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str
     semester: int = Field(index=True)
+    group_scope: str = ""
     created_at: datetime = Field(default_factory=utcnow)
 
 
@@ -130,6 +170,7 @@ class ScheduleEntry(SQLModel, table=True):
     start_time: str = ""
     end_time: str = ""
     delivery_mode: str = "offline"
+    subgroup_code: Optional[str] = None
     week_scope: str
     locked: bool = False
 

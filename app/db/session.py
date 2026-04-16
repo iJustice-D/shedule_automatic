@@ -76,6 +76,7 @@ def _recreate_scheduleentry_if_needed(connection: sqlite3.Connection) -> None:
             start_time VARCHAR DEFAULT '',
             end_time VARCHAR DEFAULT '',
             delivery_mode VARCHAR DEFAULT 'offline',
+            subgroup_code VARCHAR,
             week_scope VARCHAR NOT NULL,
             locked BOOLEAN NOT NULL,
             FOREIGN KEY(schedule_id) REFERENCES schedule (id),
@@ -90,7 +91,7 @@ def _recreate_scheduleentry_if_needed(connection: sqlite3.Connection) -> None:
         """
         INSERT INTO scheduleentry_new (
             id, schedule_id, group_id, subject_id, teacher_id, room_id, day_of_week, pair_number,
-            online_slot_number, lesson_mode, slot_category, shift, start_time, end_time, delivery_mode, week_scope, locked
+            online_slot_number, lesson_mode, slot_category, shift, start_time, end_time, delivery_mode, subgroup_code, week_scope, locked
         )
         SELECT
             id,
@@ -130,6 +131,7 @@ def _recreate_scheduleentry_if_needed(connection: sqlite3.Connection) -> None:
                 ELSE ''
             END,
             'offline',
+            NULL,
             week_scope,
             locked
         FROM scheduleentry
@@ -158,7 +160,10 @@ def _migrate_sqlite_schema() -> None:
         _ensure_column(connection, "timeslot", "shift", "VARCHAR DEFAULT 'morning'")
         _ensure_column(connection, "timeslot", "start_time", "VARCHAR DEFAULT ''")
         _ensure_column(connection, "timeslot", "end_time", "VARCHAR DEFAULT ''")
+        _ensure_column(connection, "schedule", "group_scope", "VARCHAR DEFAULT ''")
         _ensure_column(connection, "curriculumload", "delivery_mode", "VARCHAR DEFAULT 'offline'")
+        _ensure_column(connection, "curriculumload", "source_type", "VARCHAR DEFAULT 'imported'")
+        _ensure_column(connection, "curriculumload", "note", "VARCHAR DEFAULT ''")
         _recreate_scheduleentry_if_needed(connection)
         _ensure_column(connection, "scheduleentry", "shift", "VARCHAR DEFAULT ''")
         _ensure_column(connection, "scheduleentry", "start_time", "VARCHAR DEFAULT ''")
@@ -167,8 +172,22 @@ def _migrate_sqlite_schema() -> None:
         _ensure_column(connection, "scheduleentry", "online_slot_number", "INTEGER")
         _ensure_column(connection, "scheduleentry", "lesson_mode", "VARCHAR DEFAULT 'regular'")
         _ensure_column(connection, "scheduleentry", "slot_category", "VARCHAR DEFAULT 'regular'")
+        _ensure_column(connection, "scheduleentry", "subgroup_code", "VARCHAR")
         connection.execute('UPDATE "group" SET year = course WHERE year IS NULL OR year = 0')
         connection.execute('UPDATE "group" SET shift = CASE WHEN shift IS NULL OR shift = "" THEN "morning" ELSE shift END')
+        connection.execute(
+            """
+            UPDATE curriculumload
+            SET source_type = CASE
+                    WHEN source_type IS NULL OR source_type = '' THEN 'imported'
+                    ELSE source_type
+                END,
+                note = CASE
+                    WHEN note IS NULL THEN ''
+                    ELSE note
+                END
+            """
+        )
         connection.execute(
             """
             UPDATE scheduleentry

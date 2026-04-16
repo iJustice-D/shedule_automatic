@@ -30,7 +30,9 @@ from app.models import (
 )
 from app.services.importers.academic_calendar_pdf import AcademicCalendarPdfImporter
 from app.services.importers.curriculum_xls import CurriculumXlsImporter
+from app.services.online_slots import OnlineSlotService
 from app.services.online_policy import OnlinePolicyService
+from app.services.weekly_workload import WeeklyWorkloadService
 
 
 GROUP_SHIFT_MAP = {
@@ -46,8 +48,10 @@ class Seeder:
         self.curriculum_importer = CurriculumXlsImporter()
         self.calendar_importer = AcademicCalendarPdfImporter()
         self.online_policy_service = OnlinePolicyService()
+        self.online_slot_service = OnlineSlotService()
+        self.weekly_workload_service = WeeklyWorkloadService()
 
-    def seed(self, session: Session, curriculum_path: Path, calendar_path: Path) -> None:
+    def seed(self, session: Session, curriculum_path: Path, calendar_path: Path, weekly_workload_path: Path | None = None) -> None:
         departments = self._ensure_departments(session)
         self._ensure_rooms(session)
         self._refresh_timeslots(session)
@@ -61,6 +65,14 @@ class Seeder:
         self._upgrade_existing_subjects(session)
         self._ensure_default_settings(session)
         self._ensure_online_policies(session)
+        self.online_slot_service.ensure_defaults(session)
+        if weekly_workload_path and weekly_workload_path.exists():
+            self.weekly_workload_service.import_docx(
+                session,
+                weekly_workload_path,
+                calendar_path=calendar_path,
+                curriculum_path=curriculum_path,
+            )
         session.commit()
 
     def _ensure_departments(self, session: Session) -> dict[str, Department]:
@@ -282,6 +294,8 @@ class Seeder:
                         raw_total_hours=imported.raw_total_hours,
                         practice_hours=imported.practice_hours,
                         source_code=imported.subject_code,
+                        source_type="imported",
+                        note="Импортировано из учебного плана.",
                     )
                 )
                 session.commit()
@@ -384,6 +398,8 @@ class Seeder:
                             raw_total_hours=hours,
                             practice_hours=0,
                             source_code=subject.code,
+                            source_type="demo",
+                            note="Демонстрационная нагрузка.",
                         )
                     )
                 session.commit()

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from app.core.timetable import LESSON_MODE_ONLINE, LESSON_MODE_REGULAR, ONLINE_ALLOWED_DAYS, visible_pairs_for_view
-from app.models import Conflict, Group, ScheduleEntry, Timeslot
+from app.core.week_scope import format_week_scope
+from app.models import Conflict, CurriculumLoad, Group, GroupSubjectTeacher, ScheduleEntry, Subject, Teacher, TeacherSubject, Timeslot
 from app.services.exporters.context import build_schedule_context
+from app.services.exporters.pdf_exporter import PdfExporter
 from app.services.seeding import Seeder
 from app.services.timetable_service import TimetableService
 
@@ -200,3 +203,138 @@ def test_online_edit_rejects_monday_slot() -> None:
         assert str(exc) == "Онлайн-занятия доступны только в среду, четверг и пятницу."
     else:
         raise AssertionError("Ожидалась ошибка для онлайн-занятия в понедельник.")
+
+
+def test_week_scope_formatting_is_human_readable() -> None:
+    assert format_week_scope("weeks:23,24,25,27,28,30") == "23–25, 27–28, 30"
+    assert format_week_scope("all") == "Все учебные недели"
+
+
+def test_pdf_export_uses_unicode_font_and_creates_file(tmp_path) -> None:
+    session = build_session()
+    service = TimetableService()
+    schedule = service.generate_schedule(session, semester=3, group_codes=["ETB-2202"], name="PDF export")
+    exporter = PdfExporter()
+    assert exporter._ensure_font() != "Helvetica"
+    output = exporter.export(session, schedule.id or 0, tmp_path / "unicode_test.pdf")
+    assert output.exists()
+    content = output.read_bytes()
+    assert len(content) > 0
+
+
+def test_manual_curriculum_load_is_used_by_generator() -> None:
+    session = build_session()
+    service = TimetableService()
+    group = session.exec(select(Group).where(Group.code == "ETB-2202")).first()
+    teacher = session.exec(select(Teacher).order_by(Teacher.id)).first()
+    assert group is not None
+    assert teacher is not None
+    subject = Subject(
+        code="MANUAL-SUB-1",
+        name="Ручной модуль для генератора",
+        owner_department_id=group.home_department_id,
+        lesson_type="lecture",
+        requires_special_room=False,
+        can_be_online=False,
+        default_delivery_mode="offline",
+    )
+    session.add(subject)
+    session.commit()
+    session.refresh(subject)
+    session.add(
+        TeacherSubject(
+            teacher_id=teacher.id or 0,
+            subject_id=subject.id or 0,
+            can_teach=True,
+            priority=1,
+        )
+    )
+    session.add(
+        GroupSubjectTeacher(
+            group_id=group.id or 0,
+            subject_id=subject.id or 0,
+            teacher_id=teacher.id or 0,
+            fixed=True,
+        )
+    )
+    session.add(
+        CurriculumLoad(
+            group_id=group.id or 0,
+            subject_id=subject.id or 0,
+            semester=3,
+            total_hours=32,
+            study_weeks=16,
+            hours_per_week=2.0,
+            pairs_per_week=1.0,
+            lesson_type="lecture",
+            delivery_mode="offline",
+            raw_total_hours=32,
+            practice_hours=0,
+            source_code=subject.code,
+            source_type="manual",
+            note="Ручной ввод для теста.",
+        )
+    )
+    session.commit()
+
+    schedule = service.generate_schedule(session, semester=3, group_codes=["ETB-2202"], name="Manual load")
+    manual_entries = session.exec(
+        select(ScheduleEntry).where(
+            ScheduleEntry.schedule_id == schedule.id,
+            ScheduleEntry.subject_id == subject.id,
+        )
+    ).all()
+    assert manual_entries
+
+
+def test_result_diagnostics_are_scoped_to_selected_group_and_semester() -> None:
+    session = build_session()
+    service = TimetableService()
+    service.import_weekly_workload(
+        session,
+        BASE_DIR / "data" / "2025-2026 ПРОГРАММИСТТЕР_ИНКАР (1) (2) (1).docx",
+        calendar_path=BASE_DIR / "data" / "Үрдіс 2025-2026 оқу жылы соңғысы (1).pdf",
+        curriculum_path=BASE_DIR / "data" / "Оқу жоспар_ЕТБ-1124.xls",
+    )
+    group = session.exec(select(Group).where(Group.code == "ETB-1124-1")).first()
+    assert group is not None
+    schedule = service.generate_schedule(session, semester=4, group_codes=["ETB-1124-1"], name="Scoped semester 4")
+    diagnostics = service.result_diagnostics(session, schedule.id or 0, group.id or 0)
+
+    assert diagnostics["summary"]["selected_group"] == "ETB-1124-1"
+    assert diagnostics["summary"]["selected_semester"] == 4
+    assert diagnostics["subject_rows"]
+    assert all(row["group_id"] == (group.id or 0) for row in diagnostics["subject_rows"])
+    for conflict in diagnostics["hard_conflicts"] + diagnostics["unscheduled_conflicts"]:
+        if conflict.details_json:
+            details = json.loads(conflict.details_json)
+            if "group_id" in details:
+                assert details["group_id"] == (group.id or 0)
+
+
+def test_subject_completeness_never_silently_loses_source_rows() -> None:
+    session = build_session()
+    service = TimetableService()
+    service.import_weekly_workload(
+        session,
+        BASE_DIR / "data" / "2025-2026 ПРОГРАММИСТТЕР_ИНКАР (1) (2) (1).docx",
+        calendar_path=BASE_DIR / "data" / "Үрдіс 2025-2026 оқу жылы соңғысы (1).pdf",
+        curriculum_path=BASE_DIR / "data" / "Оқу жоспар_ЕТБ-1124.xls",
+        group_codes=["ETB-1124-1"],
+    )
+    group = session.exec(select(Group).where(Group.code == "ETB-1124-1")).first()
+    assert group is not None
+    schedule = service.generate_schedule(session, semester=4, group_codes=["ETB-1124-1"], name="Completeness semester 4")
+    diagnostics = service.result_diagnostics(session, schedule.id or 0, group.id or 0)
+    statuses = {row["status"] for row in diagnostics["subject_rows"]}
+
+    assert diagnostics["summary"]["expected_subjects_count"] == len(diagnostics["subject_rows"])
+    assert statuses
+    assert statuses & {
+        "Полностью размещено",
+        "Частично размещено",
+        "Не размещено",
+        "Исключено как факультатив (если не включено)",
+        "Исключено из обычной сетки как практика",
+        "Требуется уточнение преподавателя",
+    }

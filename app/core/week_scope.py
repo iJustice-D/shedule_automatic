@@ -39,3 +39,20 @@ def spread_weeks(weeks: list[int], required: int) -> list[int]:
     for index in range(required):
         picks.append(weeks[floor(index * step)])
     return sorted(set(picks))
+
+
+def format_week_scope(value: str, all_weeks_label: str = "Все учебные недели") -> str:
+    weeks = sorted(decode_week_scope(value))
+    if not weeks:
+        return all_weeks_label
+    ranges: list[str] = []
+    start = weeks[0]
+    end = weeks[0]
+    for week in weeks[1:]:
+        if week == end + 1:
+            end = week
+            continue
+        ranges.append(f"{start}–{end}" if start != end else str(start))
+        start = end = week
+    ranges.append(f"{start}–{end}" if start != end else str(start))
+    return ", ".join(ranges)
