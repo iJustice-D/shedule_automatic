@@ -7,7 +7,7 @@ from sqlmodel import Session, SQLModel, create_engine, select
 
 from app.core.timetable import LESSON_MODE_ONLINE, LESSON_MODE_REGULAR, ONLINE_ALLOWED_DAYS, visible_pairs_for_view
 from app.core.week_scope import format_week_scope
-from app.models import Conflict, CurriculumLoad, Group, GroupSubjectTeacher, ScheduleEntry, Subject, Teacher, TeacherSubject, Timeslot
+from app.models import Conflict, CurriculumLoad, GenerationJob, Group, GroupSubjectTeacher, Schedule, ScheduleEntry, Subject, Teacher, TeacherSubject, Timeslot
 from app.services.exporters.context import build_schedule_context
 from app.services.exporters.pdf_exporter import PdfExporter
 from app.services.seeding import Seeder
@@ -337,4 +337,54 @@ def test_subject_completeness_never_silently_loses_source_rows() -> None:
         "Исключено как факультатив (если не включено)",
         "Исключено из обычной сетки как практика",
         "Требуется уточнение преподавателя",
+    }
+
+
+def test_generation_job_creates_scoped_result_and_history() -> None:
+    session = build_session()
+    service = TimetableService()
+    group = session.exec(select(Group).where(Group.code == "ETB-2202")).first()
+    assert group is not None
+
+    job = service.create_generation_job(session, group_id=group.id or 0, semester=3, requested_name="Job flow")
+    finished = service.run_generation_job(job.id or 0)
+
+    assert finished.status == "completed"
+    assert finished.result_schedule_id is not None
+    result_schedule = session.get(Schedule, finished.result_schedule_id)
+    assert result_schedule is not None
+    assert result_schedule.semester == 3
+    assert result_schedule.group_scope == "ETB-2202"
+    history = service.list_generation_jobs(session, group_id=group.id or 0, semester=3)
+    assert history
+    assert any(item.id == finished.id for item in history)
+
+
+def test_generation_job_fails_without_workload() -> None:
+    session = build_session()
+    service = TimetableService()
+    existing_group = session.exec(select(Group)).first()
+    assert existing_group is not None
+    empty_group = Group(
+        code="EMPTY-TEST-1",
+        name="EMPTY-TEST-1",
+        home_department_id=existing_group.home_department_id,
+        course=2,
+        year=2,
+        semester=4,
+        student_count=20,
+        shift="morning",
+    )
+    session.add(empty_group)
+    session.commit()
+    session.refresh(empty_group)
+
+    job = service.create_generation_job(session, group_id=empty_group.id or 0, semester=4, requested_name="Should fail")
+    finished = service.run_generation_job(job.id or 0)
+
+    assert finished.status == "failed"
+    assert finished.result_schedule_id is None
+    assert finished.summary_message in {
+        "Для выбранной группы нет учебной нагрузки.",
+        "Невозможно запустить генерацию: отсутствуют нормализованные данные.",
     }

@@ -154,6 +154,24 @@ class Schedule(SQLModel, table=True):
     created_at: datetime = Field(default_factory=utcnow)
 
 
+class GenerationJob(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    created_at: datetime = Field(default_factory=utcnow)
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    status: str = Field(default="pending", index=True)
+    group_id: int = Field(foreign_key="group.id", index=True)
+    semester: int = Field(index=True)
+    generation_mode: str = "best_effort"
+    include_facultatives: bool = False
+    enable_online: bool = True
+    source_scope: str = "normalized_weekly"
+    progress_percent: int = 0
+    summary_message: str = ""
+    requested_name: str = ""
+    result_schedule_id: Optional[int] = Field(default=None, foreign_key="schedule.id", index=True)
+
+
 class ScheduleEntry(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     schedule_id: int = Field(foreign_key="schedule.id", index=True)

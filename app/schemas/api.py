@@ -8,7 +8,12 @@ from pydantic import BaseModel, Field
 class GenerateRequest(BaseModel):
     name: Optional[str] = None
     semester: int = Field(ge=3, le=4)
+    group_id: Optional[int] = None
     group_codes: list[str] = Field(default_factory=list)
+    generation_mode: str = "best_effort"
+    include_facultatives: bool = False
+    enable_online: bool = True
+    source_scope: str = "normalized_weekly"
 
 
 class EntryUpdate(BaseModel):

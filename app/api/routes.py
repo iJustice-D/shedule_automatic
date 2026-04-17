@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, select
 
 from app.db.session import get_session
-from app.models import AcademicPeriod, AppSetting, Conflict, CurriculumLoad, Group, OnlineSlot, Room, Schedule, ScheduleEntry, Subject, Suggestion, Teacher, WeeklyLoad
+from app.models import AcademicPeriod, AppSetting, Conflict, CurriculumLoad, GenerationJob, Group, OnlineSlot, Room, Schedule, ScheduleEntry, Subject, Suggestion, Teacher, WeeklyLoad
 from app.schemas.api import CalendarPeriodUpdate, EntryUpdate, GenerateRequest, SettingUpdate, TeacherCreate, TeacherRename
 from app.services.timetable_service import TimetableService
 
@@ -128,15 +128,46 @@ def list_schedules(session: Session = Depends(get_session)):
     return as_json(session.exec(select(Schedule).order_by(Schedule.created_at.desc())).all())
 
 
+@router.get("/generation-jobs")
+def list_generation_jobs(group_id: int | None = None, semester: int | None = None, session: Session = Depends(get_session)):
+    return as_json(service.list_generation_jobs(session, group_id=group_id, semester=semester))
+
+
+@router.get("/generation-jobs/{job_id}")
+def get_generation_job(job_id: int, session: Session = Depends(get_session)):
+    job = service.get_generation_job(session, job_id)
+    if job is None:
+        raise HTTPException(404, "Запуск генерации не найден.")
+    return as_json(job)
+
+
 @router.post("/schedules/generate")
 def generate_schedule(payload: GenerateRequest, session: Session = Depends(get_session)):
-    schedule = service.generate_schedule(
+    group_id = payload.group_id
+    if group_id is None and payload.group_codes:
+        group = session.exec(select(Group).where(Group.code == payload.group_codes[0])).first()
+        group_id = group.id if group else None
+    if group_id is None:
+        raise HTTPException(400, "Нужно выбрать группу для генерации.")
+    job = service.create_generation_job(
         session,
+        group_id=group_id,
         semester=payload.semester,
-        group_codes=payload.group_codes or None,
-        name=payload.name,
+        requested_name=payload.name or "",
+        generation_mode=payload.generation_mode,
+        include_facultatives=payload.include_facultatives,
+        enable_online=payload.enable_online,
+        source_scope=payload.source_scope,
     )
-    return as_json(schedule)
+    job = service.run_generation_job(job.id or 0)
+    if job.status != "completed" or not job.result_schedule_id:
+        raise HTTPException(400, job.summary_message or "Расписание для выбранной группы не было построено.")
+    schedule = session.get(Schedule, job.result_schedule_id)
+    data = as_json(schedule)
+    data["generation_job_id"] = job.id
+    data["generation_status"] = job.status
+    data["generation_summary"] = job.summary_message
+    return data
 
 
 @router.get("/schedules/{schedule_id}/entries")

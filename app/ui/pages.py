@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import contextmanager
 from itertools import combinations
 from pathlib import Path
@@ -32,7 +33,7 @@ from app.core.timetable import (
 )
 from app.core.week_scope import format_week_scope, scopes_overlap
 from app.db.session import engine
-from app.models import AcademicPeriod, AppSetting, Conflict, CurriculumLoad, Department, Group, OnlinePolicy, Room, Schedule, ScheduleEntry, Subject, Suggestion, Teacher
+from app.models import AcademicPeriod, AppSetting, Conflict, CurriculumLoad, Department, GenerationJob, Group, OnlinePolicy, Room, Schedule, ScheduleEntry, Subject, Suggestion, Teacher
 from app.models import OnlineSlot, WeeklyLoad
 from app.services.timetable_service import TimetableService
 from app.ui.i18n import t
@@ -186,6 +187,16 @@ def source_type_label(value: str) -> str:
 
 def severity_label(value: str) -> str:
     return tr(f"severity.{value}")
+
+
+def generation_status_label(value: str) -> str:
+    labels = {
+        "pending": tr("generator.status_pending"),
+        "running": tr("generator.status_running"),
+        "completed": tr("generator.status_completed"),
+        "failed": tr("generator.status_failed"),
+    }
+    return labels.get(value, value)
 
 
 def teacher_filter_options(rows: list[Teacher]) -> dict[int, str]:
@@ -979,64 +990,171 @@ def generator_page() -> None:
     with page_shell(tr("page.generator")):
         with session_scope() as session:
             groups = session.exec(select(Group).order_by(Group.code)).all()
-            schedules = session.exec(select(Schedule).order_by(Schedule.created_at.desc())).all()
-        semester = ui.select({3: f"{tr('common.semester')} 3", 4: f"{tr('common.semester')} 4"}, value=3, label=tr("common.semester")).classes("w-56")
-        selected_groups = ui.select(selection_options(groups), multiple=True, label=tr("nav.groups")).classes("w-full")
-        schedule_name = ui.input(tr("generator.schedule_name"), value=f"{tr('common.schedule')} {tr('common.semester')} 3").classes("w-full")
-        ui.button(
-            tr("generator.generate"),
-            on_click=lambda: _generate_schedule(int(semester.value), list(selected_groups.value or []), schedule_name.value),
-        ).props("color=amber-8")
-        ui.separator()
-        ui.label(tr("generator.existing")).classes("text-lg font-semibold")
-        ui.table(
-            columns=[
-                {"name": "name", "label": tr("common.name"), "field": "name"},
-                {"name": "semester", "label": tr("common.semester"), "field": "semester"},
-                {"name": "created_at", "label": tr("table.created_at"), "field": "created_at"},
-            ],
-            rows=[schedule.model_dump(mode="json") for schedule in schedules],
-            row_key="id",
-        ).classes("panel-card w-full")
+        initial_group_id = groups[0].id if groups else None
+        state = {
+            "group_id": initial_group_id,
+            "semester": 4,
+            "latest_result_id": None,
+        }
 
-        def _generate_schedule(selected_semester: int, group_ids: list[int], name: str) -> None:
+        with ui.dialog() as generation_dialog, ui.card().classes("panel-card p-5 min-w-[620px]"):
+            ui.label(tr("generator.running")).classes("text-lg font-semibold")
+            step_label = ui.label(tr("generator.stage_prepare")).classes("text-sm text-[#6b7280]")
+            progress_bar = ui.linear_progress(value=0.0).classes("w-full")
+            status_label = ui.label(tr("generator.status_pending")).classes("text-sm")
+            summary_label = ui.label("").classes("text-sm modal-text")
+            with ui.row().classes("justify-end gap-2 w-full mt-4"):
+                open_result_button = ui.button(
+                    tr("generator.open_result"),
+                    on_click=lambda: ui.navigate.to(f"/editor/{state['latest_result_id']}"),
+                ).props("color=amber-8")
+                open_result_button.disable()
+                ui.button(tr("common.cancel"), on_click=generation_dialog.close).props("flat")
+
+        with ui.row().classes("gap-3 w-full items-end"):
+            group_select = ui.select(selection_options(groups), value=state["group_id"], label=tr("common.group")).classes("w-[26rem]")
+            semester = ui.select({3: f"{tr('common.semester')} 3", 4: f"{tr('common.semester')} 4"}, value=state["semester"], label=tr("common.semester")).classes("w-56")
+            include_facultatives = ui.switch(tr("generator.include_facultatives"), value=False)
+            enable_online = ui.switch(tr("generator.enable_online"), value=True)
+        schedule_name = ui.input(tr("generator.schedule_name"), value="").classes("w-full")
+
+        @ui.refreshable
+        def render_history() -> None:
             with session_scope() as session:
-                target_codes = [session.get(Group, group_id).code for group_id in group_ids] if group_ids else None
-                schedule = service.generate_schedule(
-                    session,
-                    semester=selected_semester,
-                    group_codes=target_codes,
-                    name=name or None,
-                )
-                conflicts = session.exec(select(Conflict).where(Conflict.schedule_id == schedule.id)).all()
-            if any(conflict.severity == "hard" for conflict in conflicts):
-                ui.notify(tr("generator.created_with_conflicts", name=schedule.name), color="warning", multi_line=True, timeout=7000)
-            else:
-                ui.notify(tr("generator.created", name=schedule.name), color="positive")
-            ui.navigate.to("/editor")
+                jobs = service.list_generation_jobs(session, limit=12)
+                group_map = {group.id: group for group in session.exec(select(Group)).all()}
+            ui.label(tr("generator.history")).classes("text-lg font-semibold mt-4")
+            if not jobs:
+                ui.label(tr("generator.history_empty")).classes("text-sm text-[#6b7280]")
+                return
+            with ui.column().classes("w-full gap-3"):
+                for job in jobs:
+                    group = group_map.get(job.group_id)
+                    with ui.card().classes("panel-card p-4 w-full"):
+                        ui.label(
+                            f"{group.code if group else job.group_id} | {tr('common.semester')} {job.semester} | "
+                            f"{generation_status_label(job.status)}"
+                        ).classes("font-semibold")
+                        ui.label(job.summary_message or "—").classes("text-sm text-[#6b7280]")
+                        with ui.row().classes("gap-2 mt-2"):
+                            ui.label(f"ID: {job.id}").classes("text-xs text-[#6b7280]")
+                            ui.label(str(job.created_at)).classes("text-xs text-[#6b7280]")
+                            if job.result_schedule_id:
+                                ui.button(
+                                    tr("generator.open_result"),
+                                    on_click=lambda result_id=job.result_schedule_id: ui.navigate.to(f"/editor/{result_id}"),
+                                ).props("outline color=dark")
+
+        async def _generate_schedule() -> None:
+            if not group_select.value:
+                ui.notify(tr("generator.group_required"), color="negative")
+                return
+            try:
+                with session_scope() as session:
+                    job = service.create_generation_job(
+                        session,
+                        group_id=int(group_select.value),
+                        semester=int(semester.value),
+                        requested_name=schedule_name.value or "",
+                        generation_mode="best_effort",
+                        include_facultatives=bool(include_facultatives.value),
+                        enable_online=bool(enable_online.value),
+                        source_scope="normalized_weekly",
+                    )
+            except ValueError as exc:
+                ui.notify(str(exc), color="negative", multi_line=True)
+                return
+
+            state["latest_result_id"] = None
+            step_label.set_text(tr("generator.stage_prepare"))
+            status_label.set_text(tr("generator.status_pending"))
+            summary_label.set_text("")
+            progress_bar.value = 0.0
+            open_result_button.disable()
+            generation_dialog.open()
+
+            task = asyncio.create_task(asyncio.to_thread(service.run_generation_job, job.id or 0))
+            while not task.done():
+                with session_scope() as session:
+                    current_job = service.get_generation_job(session, job.id or 0)
+                if current_job is not None:
+                    step_label.set_text(current_job.summary_message or tr("generator.running"))
+                    status_label.set_text(generation_status_label(current_job.status))
+                    progress_bar.value = max(0.0, min(float(current_job.progress_percent) / 100.0, 1.0))
+                await asyncio.sleep(0.1)
+
+            finished_job = await task
+            status_label.set_text(generation_status_label(finished_job.status))
+            progress_bar.value = 1.0
+            if finished_job.status == "completed":
+                step_label.set_text(tr("generator.done"))
+            summary_label.set_text(finished_job.summary_message or "")
+            render_history.refresh()
+            if finished_job.status != "completed" or not finished_job.result_schedule_id:
+                ui.notify(finished_job.summary_message or tr("generator.failed_generic"), color="negative", multi_line=True)
+                return
+            state["latest_result_id"] = finished_job.result_schedule_id
+            open_result_button.enable()
+            ui.notify(tr("generator.created", name=f"{group_select.options.get(group_select.value, '')} / {tr('common.semester')} {semester.value}"), color="positive")
+
+        ui.button(
+            tr("generator.run"),
+            on_click=_generate_schedule,
+        ).props("color=amber-8")
+        render_history()
 
 
-@ui.page("/editor")
-def editor_page() -> None:
+def _render_editor_page(result_id: int | None = None) -> None:
     with page_shell(tr("page.editor")):
         with session_scope() as session:
-            schedules = session.exec(select(Schedule).order_by(Schedule.created_at.desc())).all()
             groups = session.exec(select(Group).order_by(Group.code)).all()
             teachers = session.exec(select(Teacher).order_by(Teacher.full_name)).all()
             rooms = session.exec(select(Room).order_by(Room.code)).all()
+            jobs = service.list_generation_jobs(session, limit=40)
         group_map = {group.id: group for group in groups}
+        initial_group_id = groups[0].id if groups else None
+        initial_semester = 4 if groups else 3
+        initial_schedule_id = result_id
+        if result_id is not None:
+            with session_scope() as session:
+                selected_schedule = session.get(Schedule, result_id)
+                if selected_schedule is not None:
+                    initial_semester = selected_schedule.semester
+                    codes = [item.strip() for item in (selected_schedule.group_scope or "").split(",") if item.strip()]
+                    group = session.exec(select(Group).where(Group.code == codes[0])).first() if len(codes) == 1 else None
+                    if group is not None:
+                        initial_group_id = group.id
+        if initial_schedule_id is None and initial_group_id is not None:
+            with session_scope() as session:
+                latest = service.latest_result_for_scope(session, group_id=int(initial_group_id), semester=initial_semester)
+                initial_schedule_id = latest.id if latest else None
         state = {
-            "schedule_id": schedules[0].id if schedules else None,
+            "schedule_id": initial_schedule_id,
             "view_mode": "group",
-            "group_id": groups[0].id if groups else None,
+            "group_id": initial_group_id,
+            "semester": initial_semester,
             "teacher_id": 0,
             "shift_filter": "all",
         }
 
+        def result_options(group_id: int | None, semester: int) -> dict[int, str]:
+            if group_id is None:
+                return {}
+            with session_scope() as session:
+                scoped_jobs = service.list_generation_jobs(session, group_id=group_id, semester=semester, limit=30)
+            options: dict[int, str] = {}
+            for job in scoped_jobs:
+                if job.status != "completed" or not job.result_schedule_id:
+                    continue
+                options[job.result_schedule_id] = (
+                    f"#{job.id} | {generation_status_label(job.status)} | {job.created_at.strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+            return options
+
         @ui.refreshable
         def render_grid() -> None:
             if not state["schedule_id"]:
-                ui.label(tr("editor.no_schedule"))
+                ui.label(tr("editor.no_scoped_schedule")).classes("text-sm text-[#6b7280]")
                 return
             with session_scope() as session:
                 entries = session.exec(select(ScheduleEntry).where(ScheduleEntry.schedule_id == state["schedule_id"])).all()
@@ -1130,6 +1248,7 @@ def editor_page() -> None:
         @ui.refreshable
         def render_feedback() -> None:
             if not state["schedule_id"]:
+                ui.label(tr("editor.no_scoped_schedule")).classes("text-sm text-[#6b7280]")
                 return
             with session_scope() as session:
                 diagnostics = service.result_diagnostics(session, state["schedule_id"], state["group_id"] or None)
@@ -1144,6 +1263,14 @@ def editor_page() -> None:
                     )
                 ).all()
             summary = diagnostics["summary"]
+            schedule = diagnostics["schedule"]
+            ui.label(
+                tr(
+                    "editor.current_result_meta",
+                    result_id=schedule.id,
+                    created_at=schedule.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+                )
+            ).classes("text-sm text-[#6b7280] mt-3")
             ui.label(tr("editor.result_summary")).classes("text-lg font-semibold mt-4")
             with ui.grid(columns=4).classes("w-full gap-3"):
                 summary_rows = [
@@ -1369,17 +1496,27 @@ def editor_page() -> None:
             render_grid.refresh()
             render_feedback.refresh()
 
+        def _switch_scope(group_id: int | None, semester: int, result_select_widget, grid_refreshable, feedback_refreshable, state_ref: dict) -> None:
+            state_ref["group_id"] = group_id
+            state_ref["semester"] = semester
+            options = result_options(group_id, semester)
+            result_select_widget.options = options
+            state_ref["schedule_id"] = next(iter(options.keys()), None)
+            result_select_widget.value = state_ref["schedule_id"]
+            grid_refreshable.refresh()
+            feedback_refreshable.refresh()
+
         with ui.row().classes("gap-3 w-full"):
-            ui.select(
-                selection_options(schedules, "name"),
+            result_select = ui.select(
+                result_options(state["group_id"], state["semester"]),
                 value=state["schedule_id"],
-                label=tr("common.schedule"),
+                label=tr("editor.result_selector"),
                 on_change=lambda event: (
                     state.update({"schedule_id": event.value}),
                     render_grid.refresh(),
                     render_feedback.refresh(),
                 ),
-            )
+            ).classes("w-[28rem]")
             ui.select(
                 {"group": tr("editor.group_view"), "teacher": tr("editor.teacher_view")},
                 value=state["view_mode"],
@@ -1390,7 +1527,13 @@ def editor_page() -> None:
                 selection_options(groups),
                 value=state["group_id"],
                 label=tr("common.group"),
-                on_change=lambda event: (state.update({"group_id": event.value}), render_grid.refresh()),
+                on_change=lambda event: _switch_scope(event.value, state["semester"], result_select, render_grid, render_feedback, state),
+            )
+            ui.select(
+                {3: f"{tr('common.semester')} 3", 4: f"{tr('common.semester')} 4"},
+                value=state["semester"],
+                label=tr("common.semester"),
+                on_change=lambda event: _switch_scope(state["group_id"], event.value, result_select, render_grid, render_feedback, state),
             )
             ui.select(
                 teacher_filter_options(teachers),
@@ -1409,13 +1552,34 @@ def editor_page() -> None:
         render_feedback()
 
 
+@ui.page("/editor")
+def editor_page() -> None:
+    _render_editor_page()
+
+
+@ui.page("/editor/{result_id}")
+def editor_page_result(result_id: int) -> None:
+    _render_editor_page(result_id)
+
+
 @ui.page("/conflicts")
 def conflicts_page() -> None:
     with page_shell(tr("page.conflicts")):
         with session_scope() as session:
-            schedules = session.exec(select(Schedule).order_by(Schedule.created_at.desc())).all()
             groups = session.exec(select(Group).order_by(Group.code)).all()
-        state = {"schedule_id": schedules[0].id if schedules else None, "group_id": 0}
+            jobs = service.list_generation_jobs(session, limit=40)
+        group_map = {group.id: group for group in groups}
+        result_options = {
+            job.result_schedule_id or 0: (
+                f"#{job.id} | {(group_map.get(job.group_id).code if job.group_id in group_map else job.group_id)} | "
+                f"{tr('common.semester')} {job.semester}"
+            )
+            for job in jobs
+            if job.status == "completed" and job.result_schedule_id
+        }
+        if not result_options:
+            result_options = {}
+        state = {"schedule_id": next(iter(result_options.keys()), None), "group_id": 0}
         explanation_state = {"message": ""}
 
         with ui.dialog() as explanation_dialog, ui.card().classes("panel-card p-5 min-w-[760px] max-w-[960px]"):
@@ -1493,9 +1657,9 @@ def conflicts_page() -> None:
             explanation_dialog.open()
 
         ui.select(
-            selection_options(schedules, "name"),
+            result_options,
             value=state["schedule_id"],
-            label=tr("common.schedule"),
+            label=tr("editor.result_selector"),
             on_change=lambda event: (state.update({"schedule_id": event.value}), render_conflicts.refresh()),
         )
         ui.select(

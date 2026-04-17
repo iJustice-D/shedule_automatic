@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 
@@ -8,6 +9,7 @@ from sqlmodel import Session, select
 
 from app.core.config import settings
 from app.core.timetable import (
+    DAYS,
     DELIVERY_HYBRID,
     DELIVERY_OFFLINE,
     DELIVERY_ONLINE,
@@ -27,12 +29,14 @@ from app.core.timetable import (
     room_required,
 )
 from app.core.week_scope import decode_week_scope, scopes_overlap
+from app.db.session import engine
 from app.models import (
     AcademicPeriod,
     AppSetting,
     ChangeLog,
     Conflict,
     CurriculumLoad,
+    GenerationJob,
     Group,
     GroupSubjectTeacher,
     OnlineSlot,
@@ -62,6 +66,7 @@ from app.services.weekly_workload import WeeklyWorkloadService
 
 class TimetableService:
     def __init__(self) -> None:
+        self.engine = engine
         self.generator = HybridScheduleGenerator()
         self.conflict_engine = ConflictEngine()
         self.suggestion_engine = SuggestionEngine()
@@ -78,10 +83,159 @@ class TimetableService:
         semester: int,
         group_codes: list[str] | None = None,
         name: str | None = None,
+        include_facultatives: bool = False,
+        enable_online: bool = True,
     ) -> Schedule:
-        schedule = self.generator.generate(session, semester=semester, group_codes=group_codes, schedule_name=name)
+        schedule = self.generator.generate(
+            session,
+            semester=semester,
+            group_codes=group_codes,
+            schedule_name=name,
+            include_facultatives=include_facultatives,
+            enable_online=enable_online,
+        )
         self.revalidate_schedule(session, schedule.id or 0)
         return session.get(Schedule, schedule.id)
+
+    @staticmethod
+    def _utcnow() -> datetime:
+        return datetime.now(timezone.utc)
+
+    def create_generation_job(
+        self,
+        session: Session,
+        *,
+        group_id: int,
+        semester: int,
+        requested_name: str = "",
+        generation_mode: str = "best_effort",
+        include_facultatives: bool = False,
+        enable_online: bool = True,
+        source_scope: str = "normalized_weekly",
+    ) -> GenerationJob:
+        self.engine = session.get_bind()
+        group = session.get(Group, group_id)
+        if group is None:
+            raise ValueError("Выбранная группа не найдена.")
+        job = GenerationJob(
+            group_id=group_id,
+            semester=semester,
+            requested_name=requested_name,
+            generation_mode=generation_mode,
+            include_facultatives=include_facultatives,
+            enable_online=enable_online,
+            source_scope=source_scope,
+            status="pending",
+            progress_percent=0,
+            summary_message="Подготовка данных",
+        )
+        session.add(job)
+        session.commit()
+        session.refresh(job)
+        return job
+
+    def list_generation_jobs(
+        self,
+        session: Session,
+        *,
+        group_id: int | None = None,
+        semester: int | None = None,
+        limit: int = 20,
+    ) -> list[GenerationJob]:
+        query = select(GenerationJob).order_by(GenerationJob.created_at.desc())
+        if group_id is not None:
+            query = query.where(GenerationJob.group_id == group_id)
+        if semester is not None:
+            query = query.where(GenerationJob.semester == semester)
+        return session.exec(query.limit(limit)).all()
+
+    def latest_result_for_scope(self, session: Session, *, group_id: int, semester: int) -> Schedule | None:
+        job = session.exec(
+            select(GenerationJob).where(
+                GenerationJob.group_id == group_id,
+                GenerationJob.semester == semester,
+                GenerationJob.status == "completed",
+                GenerationJob.result_schedule_id.is_not(None),
+            ).order_by(GenerationJob.finished_at.desc(), GenerationJob.created_at.desc())
+        ).first()
+        if job is None or not job.result_schedule_id:
+            return None
+        return session.get(Schedule, job.result_schedule_id)
+
+    def get_generation_job(self, session: Session, job_id: int) -> GenerationJob | None:
+        return session.get(GenerationJob, job_id)
+
+    def run_generation_job(self, job_id: int) -> GenerationJob:
+        try:
+            self._update_job(job_id, status="running", progress=5, message="Подготовка данных", started=True)
+            with Session(self.engine) as session:
+                job = session.get(GenerationJob, job_id)
+                if job is None:
+                    raise ValueError("Запуск генерации не найден.")
+                group = session.get(Group, job.group_id)
+                if group is None:
+                    raise ValueError("Выбранная группа не найдена.")
+
+                self._update_job(job_id, progress=20, message="Нормализация нагрузки")
+                weekly_rows = self.weekly_workload_service.active_rows(session, semester=job.semester, group_ids=[group.id or 0])
+                manual_rows = session.exec(
+                    select(CurriculumLoad).where(
+                        CurriculumLoad.group_id == group.id,
+                        CurriculumLoad.semester == job.semester,
+                    )
+                ).all()
+                relevant_weekly = [
+                    row
+                    for row in weekly_rows
+                    if not row.is_practice and (job.include_facultatives or not row.is_facultative)
+                ]
+                if job.source_scope == "normalized_weekly" and not weekly_rows and not manual_rows:
+                    raise ValueError("Невозможно запустить генерацию: отсутствуют нормализованные данные.")
+                if not relevant_weekly and not manual_rows:
+                    raise ValueError("Для выбранной группы нет учебной нагрузки.")
+
+                study_weeks = session.exec(
+                    select(AcademicPeriod).where(
+                        AcademicPeriod.group_id == group.id,
+                        AcademicPeriod.semester == job.semester,
+                        AcademicPeriod.is_schedulable.is_(True),
+                    )
+                ).all()
+                if not study_weeks:
+                    raise ValueError("Для выбранного семестра нет доступных учебных недель.")
+                if not group.shift:
+                    raise ValueError("Невозможно запустить генерацию: для группы не указана смена.")
+
+                self._update_job(job_id, progress=35, message="Проверка выполнимости")
+                feasibility_message = self._feasibility_message(session, group, job.semester, relevant_weekly, manual_rows, job.enable_online)
+                self._update_job(job_id, progress=50, message="Генерация расписания")
+                schedule = self.generate_schedule(
+                    session,
+                    semester=job.semester,
+                    group_codes=[group.code],
+                    name=job.requested_name or f"Расписание {group.code} семестр {job.semester}",
+                    include_facultatives=job.include_facultatives,
+                    enable_online=job.enable_online,
+                )
+
+                self._update_job(job_id, progress=80, message="Локальная оптимизация")
+                diagnostics = self.result_diagnostics(session, schedule.id or 0, group.id or 0)
+                summary = self._job_summary(group, job.semester, diagnostics, feasibility_message)
+                self._update_job(
+                    job_id,
+                    status="completed",
+                    progress=100,
+                    message=summary,
+                    finished=True,
+                    result_schedule_id=schedule.id or 0,
+                )
+        except Exception as exc:
+            self._update_job(job_id, status="failed", progress=100, message=str(exc), finished=True)
+        with Session(self.engine) as session:
+            job = session.get(GenerationJob, job_id)
+            if job is None:
+                raise ValueError("Запуск генерации не найден.")
+            return job
 
     def revalidate_schedule(self, session: Session, schedule_id: int) -> tuple[list[Conflict], list[Suggestion]]:
         schedule = session.get(Schedule, schedule_id)
@@ -390,6 +544,82 @@ class TimetableService:
 
     def unresolved_weekly_rows(self, session: Session, semester: int | None = None) -> list[WeeklyLoad]:
         return self.weekly_workload_service.unresolved_rows(session, semester=semester)
+
+    def _update_job(
+        self,
+        job_id: int,
+        *,
+        status: str | None = None,
+        progress: int | None = None,
+        message: str | None = None,
+        started: bool = False,
+        finished: bool = False,
+        result_schedule_id: int | None = None,
+    ) -> None:
+        with Session(self.engine) as session:
+            job = session.get(GenerationJob, job_id)
+            if job is None:
+                return
+            if status is not None:
+                job.status = status
+            if progress is not None:
+                job.progress_percent = progress
+            if message is not None:
+                job.summary_message = message
+            if started and job.started_at is None:
+                job.started_at = self._utcnow()
+            if finished:
+                job.finished_at = self._utcnow()
+            if result_schedule_id is not None:
+                job.result_schedule_id = result_schedule_id
+            session.add(job)
+            session.commit()
+
+    def _feasibility_message(
+        self,
+        session: Session,
+        group: Group,
+        semester: int,
+        weekly_rows: list[WeeklyLoad],
+        manual_rows: list[CurriculumLoad],
+        enable_online: bool,
+    ) -> str:
+        required_regular_pairs = round(
+            sum(row.weekly_pairs for row in weekly_rows if row.delivery_mode != DELIVERY_ONLINE) + sum(load.pairs_per_week for load in manual_rows),
+            2,
+        )
+        available_regular_slots = len(allowed_pairs_for_shift(group.shift)) * len(DAYS)
+        available_online_slots = len(self.online_slot_service.active_slots(session)) if enable_online else 0
+        unresolved_rows = sum(
+            1
+            for row in weekly_rows
+            if row.assignment_state in {"vacancy", "candidate_pool", "multi_teacher", "unresolved_manual_review"}
+        )
+        parts = [
+            f"Ожидалось пар: {required_regular_pairs}",
+            f"Доступно обычных слотов: {available_regular_slots}",
+            f"Доступно онлайн-слотов: {available_online_slots}",
+        ]
+        if unresolved_rows:
+            parts.append(f"Неразрешённых строк: {unresolved_rows}")
+        if required_regular_pairs > available_regular_slots + available_online_slots:
+            parts.append(
+                f"Не хватает пар: {round(required_regular_pairs - available_regular_slots - available_online_slots, 2)}"
+            )
+        return ". ".join(parts)
+
+    @staticmethod
+    def _job_summary(group: Group, semester: int, diagnostics: dict[str, object], feasibility_message: str) -> str:
+        summary = diagnostics["summary"]
+        base = (
+            f"{group.code}, семестр {semester}: полностью размещено {summary['fully_placed_subjects_count']} из "
+            f"{summary['expected_subjects_count']} предметов."
+        )
+        if summary["total_missing_pairs"]:
+            base += f" Не хватает пар: {summary['total_missing_pairs']}."
+        if summary["hard_conflicts_count"]:
+            base += f" Жёстких конфликтов: {summary['hard_conflicts_count']}."
+        return f"{base} {feasibility_message}".strip()
 
     def result_diagnostics(self, session: Session, schedule_id: int, group_id: int | None = None) -> dict[str, object]:
         schedule = session.get(Schedule, schedule_id)

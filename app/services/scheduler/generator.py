@@ -71,6 +71,8 @@ class HybridScheduleGenerator:
         semester: int,
         group_codes: list[str] | None = None,
         schedule_name: str | None = None,
+        include_facultatives: bool = False,
+        enable_online: bool = True,
     ) -> Schedule:
         groups_query = select(Group)
         if group_codes:
@@ -90,8 +92,9 @@ class HybridScheduleGenerator:
         self._teacher_base_weekly_loads = self._teacher_semester_weekly_loads(session)
         self._semester_week_counts = self._semester_study_week_counts(session)
 
-        demands = self._collect_demands(session, semester, groups)
-        self._apply_online_targets(session, groups, demands)
+        demands = self._collect_demands(session, semester, groups, include_facultatives=include_facultatives)
+        if enable_online:
+            self._apply_online_targets(session, groups, demands)
         teacher_pressure = self._teacher_pressure(demands)
         regular_demands = sorted(
             [demand for demand in demands if demand.lesson_mode == LESSON_MODE_REGULAR],
@@ -113,7 +116,14 @@ class HybridScheduleGenerator:
         session.commit()
         return schedule
 
-    def _collect_demands(self, session: Session, semester: int, groups: list[Group]) -> list[SessionDemand]:
+    def _collect_demands(
+        self,
+        session: Session,
+        semester: int,
+        groups: list[Group],
+        *,
+        include_facultatives: bool = False,
+    ) -> list[SessionDemand]:
         group_ids = [group.id or 0 for group in groups]
         weekly_rows = session.exec(
             select(WeeklyLoad).where(
@@ -144,7 +154,9 @@ class HybridScheduleGenerator:
             primary_weekly = [
                 row
                 for row in weekly_by_group.get(group.id or 0, [])
-                if row.load_category == "regular" and not row.is_practice and not row.is_facultative
+                if not row.is_practice
+                and row.load_category in {"regular", "facultative"}
+                and (include_facultatives or not row.is_facultative)
             ]
             for row in primary_weekly:
                 demands.extend(self._build_weekly_demands(session, group, row, study_weeks))

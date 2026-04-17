@@ -153,6 +153,33 @@ def _migrate_sqlite_schema() -> None:
         return
     connection = sqlite3.connect(db_path)
     try:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS generationjob (
+                id INTEGER NOT NULL PRIMARY KEY,
+                created_at TIMESTAMP NOT NULL,
+                started_at TIMESTAMP,
+                finished_at TIMESTAMP,
+                status VARCHAR DEFAULT 'pending',
+                group_id INTEGER NOT NULL,
+                semester INTEGER NOT NULL,
+                generation_mode VARCHAR DEFAULT 'best_effort',
+                include_facultatives BOOLEAN DEFAULT 0,
+                enable_online BOOLEAN DEFAULT 1,
+                source_scope VARCHAR DEFAULT 'normalized_weekly',
+                progress_percent INTEGER DEFAULT 0,
+                summary_message VARCHAR DEFAULT '',
+                requested_name VARCHAR DEFAULT '',
+                result_schedule_id INTEGER,
+                FOREIGN KEY(group_id) REFERENCES "group" (id),
+                FOREIGN KEY(result_schedule_id) REFERENCES schedule (id)
+            )
+            """
+        )
+        connection.execute("CREATE INDEX IF NOT EXISTS ix_generationjob_status ON generationjob (status)")
+        connection.execute("CREATE INDEX IF NOT EXISTS ix_generationjob_group_id ON generationjob (group_id)")
+        connection.execute("CREATE INDEX IF NOT EXISTS ix_generationjob_semester ON generationjob (semester)")
+        connection.execute("CREATE INDEX IF NOT EXISTS ix_generationjob_result_schedule_id ON generationjob (result_schedule_id)")
         _ensure_column(connection, "group", "year", "INTEGER DEFAULT 1")
         _ensure_column(connection, "group", "shift", "VARCHAR DEFAULT 'morning'")
         _ensure_column(connection, "subject", "can_be_online", "BOOLEAN DEFAULT 0")
