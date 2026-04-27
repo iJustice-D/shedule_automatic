@@ -19,6 +19,7 @@ from app.models import (
 )
 from app.services.importers.curriculum_xls import CurriculumXlsImporter
 from app.services.importers.workload_docx import ImportedWeeklyLoadRow, WeeklyWorkloadDocxImporter
+from app.services.data_cleanup import normalize_visible_name
 
 
 class WeeklyWorkloadService:
@@ -104,10 +105,17 @@ class WeeklyWorkloadService:
         return session.exec(query).all()
 
     @staticmethod
+    def active_group_ids(session: Session, semester: int | None = None) -> list[int]:
+        rows = WeeklyWorkloadService.active_rows(session, semester=semester)
+        return sorted({row.group_id for row in rows if row.group_id})
+
+    @staticmethod
     def unresolved_rows(session: Session, semester: int | None = None) -> list[WeeklyLoad]:
         query = select(WeeklyLoad).where(
             WeeklyLoad.is_active.is_(True),
-            WeeklyLoad.assignment_state.in_(["vacancy", "unresolved_manual_review", "multi_teacher", "candidate_pool"]),
+            WeeklyLoad.assignment_state.in_(
+                ["vacancy", "unresolved_manual_review", "multi_teacher", "multi_teacher_ambiguous", "candidate_pool"]
+            ),
         ).order_by(WeeklyLoad.group_id, WeeklyLoad.subject_id)
         if semester is not None:
             query = query.where(WeeklyLoad.semester == semester)
@@ -145,6 +153,7 @@ class WeeklyWorkloadService:
         return sorted(report, key=lambda item: (-float(item["normalized_balance_score"]), str(item["teacher_name"])))
 
     def _ensure_group(self, session: Session, group_code: str, course: int | None, departments: dict[str, Department]) -> Group:
+        family = group_code.split("-", 1)[0] if "-" in group_code else group_code
         group = session.exec(select(Group).where(Group.code == group_code)).first()
         if group is None:
             group = Group(
@@ -156,11 +165,22 @@ class WeeklyWorkloadService:
                 semester=4,
                 student_count=25,
                 shift=SHIFT_MORNING,
+                program=family,
+                source_group_family=family,
+                is_active=True,
+                is_demo=False,
+                is_manual=False,
             )
         else:
             if course:
                 group.course = course
                 group.year = course
+            if not group.program:
+                group.program = family
+            if not group.source_group_family:
+                group.source_group_family = family
+            group.is_active = True
+            group.is_demo = False
         session.add(group)
         session.commit()
         session.refresh(group)
@@ -177,6 +197,13 @@ class WeeklyWorkloadService:
         reference = reference_map.get(key, {})
         subject_code = str(reference.get("code") or f"{row.group_code}-{row.subject_name[:18].upper()}").replace(" ", "-")
         subject = session.exec(select(Subject).where(Subject.code == subject_code)).first()
+        if subject is None:
+            subject = session.exec(
+                select(Subject).where(
+                    Subject.normalized_name == normalize_visible_name(row.subject_name),
+                    Subject.canonical_subject_id.is_(None),
+                )
+            ).first()
         lesson_type = str(reference.get("lesson_type") or ("practice" if row.is_practice else "mixed"))
         can_be_online = bool(reference.get("can_be_online") or (row.load_category == "facultative"))
         requires_special_room = bool(reference.get("requires_special_room") or row.is_practice)
@@ -185,18 +212,26 @@ class WeeklyWorkloadService:
             subject = Subject(
                 code=subject_code,
                 name=row.subject_name,
+                normalized_name=normalize_visible_name(row.subject_name),
                 owner_department_id=departments[owner_code].id or 0,
                 lesson_type=lesson_type,
                 requires_special_room=requires_special_room,
                 can_be_online=can_be_online,
                 default_delivery_mode=DELIVERY_OFFLINE,
+                is_active=True,
+                is_demo=False,
+                canonical_subject_id=None,
             )
         else:
             subject.name = row.subject_name
+            subject.normalized_name = normalize_visible_name(row.subject_name)
             subject.owner_department_id = departments[owner_code].id or 0
             subject.lesson_type = lesson_type
             subject.requires_special_room = requires_special_room
             subject.can_be_online = can_be_online
+            subject.is_active = True
+            subject.is_demo = False
+            subject.canonical_subject_id = None
         session.add(subject)
         session.commit()
         session.refresh(subject)
@@ -222,10 +257,18 @@ class WeeklyWorkloadService:
                     editable_name=name,
                     home_department_id=departments["IT"].id or 0,
                     max_weekly_pairs=24,
+                    is_active=True,
+                    is_demo=False,
+                    is_manual=False,
                 )
                 session.add(teacher)
                 session.commit()
                 session.refresh(teacher)
+            else:
+                teacher.is_active = True
+                teacher.is_demo = False
+                session.add(teacher)
+                session.commit()
             teacher_ids.append(teacher.id or 0)
             if session.exec(
                 select(TeacherSubject).where(

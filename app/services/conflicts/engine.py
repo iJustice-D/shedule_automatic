@@ -37,18 +37,22 @@ from app.models import (
 )
 from app.services.online_policy import OnlinePolicyService
 from app.services.online_slots import OnlineSlotService
+from app.services.scheduler.normalizer import WorkloadNormalizer
 
 
 class ConflictEngine:
     def __init__(self) -> None:
         self.online_policy_service = OnlinePolicyService()
         self.online_slot_service = OnlineSlotService()
+        self.normalizer = WorkloadNormalizer()
 
     def refresh(self, session: Session, schedule: Schedule) -> list[Conflict]:
         session.exec(delete(Conflict).where(Conflict.schedule_id == schedule.id))
-        entries = session.exec(select(ScheduleEntry).where(ScheduleEntry.schedule_id == schedule.id)).all()
+        related_schedule_ids = self._related_schedule_ids(session, schedule)
+        all_entries = session.exec(select(ScheduleEntry).where(ScheduleEntry.schedule_id.in_(related_schedule_ids))).all()
+        entries = [entry for entry in all_entries if entry.schedule_id == schedule.id]
         conflicts: list[Conflict] = []
-        conflicts.extend(self._detect_slot_conflicts(entries, schedule.id or 0))
+        conflicts.extend(self._detect_slot_conflicts(all_entries, schedule.id or 0))
         conflicts.extend(self._detect_teacher_eligibility(session, entries, schedule.id or 0))
         conflicts.extend(self._detect_blocked_periods(session, entries, schedule.id or 0))
         conflicts.extend(self._detect_shift_violations(session, entries, schedule.id or 0))
@@ -66,6 +70,8 @@ class ConflictEngine:
         conflicts: list[Conflict] = []
         for index, left in enumerate(entries):
             for right in entries[index + 1 :]:
+                if left.schedule_id != schedule_id and right.schedule_id != schedule_id:
+                    continue
                 if left.day_of_week != right.day_of_week:
                     continue
                 if not scopes_overlap(left.week_scope, right.week_scope):
@@ -112,6 +118,14 @@ class ConflictEngine:
                         )
                     )
         return conflicts
+
+    @staticmethod
+    def _related_schedule_ids(session: Session, schedule: Schedule) -> list[int]:
+        if schedule.generation_job_id:
+            related = session.exec(select(Schedule.id).where(Schedule.generation_job_id == schedule.generation_job_id)).all()
+            ids = [item for item in related if item is not None]
+            return ids or [schedule.id or 0]
+        return [schedule.id or 0]
 
     def _detect_teacher_eligibility(
         self,
@@ -269,191 +283,53 @@ class ConflictEngine:
         schedule: Schedule,
         entries: list[ScheduleEntry],
     ) -> list[Conflict]:
-        relevant_group_ids = self._schedule_group_ids(session, schedule)
-        subjects = {subject.id: subject for subject in session.exec(select(Subject)).all()}
-        groups = {group.id: group for group in session.exec(select(Group)).all()}
-        grouped_entries: dict[tuple[int, int, str], list[ScheduleEntry]] = defaultdict(list)
-        for entry in entries:
-            grouped_entries[(entry.group_id, entry.subject_id, entry.subgroup_code or "")].append(entry)
-
-        weekly_query = select(WeeklyLoad).where(
-            WeeklyLoad.is_active.is_(True),
-            WeeklyLoad.semester == schedule.semester,
-            WeeklyLoad.load_category == "regular",
-            WeeklyLoad.is_facultative.is_(False),
-            WeeklyLoad.is_practice.is_(False),
+        conflicts: list[Conflict] = []
+        groups = self._schedule_groups(session, schedule)
+        _, normalized_rows, _ = self.normalizer.normalize_scope(
+            session,
+            semester=schedule.semester,
+            group_codes=[group.code for group in groups],
+            include_facultatives=False,
         )
-        if relevant_group_ids:
-            weekly_query = weekly_query.where(WeeklyLoad.group_id.in_(relevant_group_ids))
-        weekly_rows = session.exec(weekly_query).all()
-        if weekly_rows:
-            return self._weekly_unscheduled_conflicts(session, schedule, entries, weekly_rows, grouped_entries, subjects, groups)
-
-        load_query = select(CurriculumLoad).where(CurriculumLoad.semester == schedule.semester)
-        if relevant_group_ids:
-            load_query = load_query.where(CurriculumLoad.group_id.in_(relevant_group_ids))
-        loads = session.exec(load_query).all()
-        relevant_loads = [load for load in loads if not relevant_group_ids or load.group_id in relevant_group_ids]
-        conflicts: list[Conflict] = []
-        study_weeks_by_group = {
-            group_id: len(
-                session.exec(
-                    select(AcademicPeriod).where(
-                        AcademicPeriod.group_id == group_id,
-                        AcademicPeriod.semester == schedule.semester,
-                        AcademicPeriod.is_schedulable.is_(True),
-                    )
-                ).all()
-            )
-            for group_id in {load.group_id for load in relevant_loads}
-        }
-        expected_pairs_by_group: dict[int, int] = defaultdict(int)
-        for load in relevant_loads:
-            expected_pairs_by_group[load.group_id] += max(int(round(load.total_hours / 2)), 1)
-        for load in relevant_loads:
-            scheduled_pairs = sum(
-                len(decode_week_scope(entry.week_scope))
-                for entry in grouped_entries.get((load.group_id, load.subject_id, ""), [])
-            )
-            expected_pairs = max(int(round(load.total_hours / 2)), 1)
-            if scheduled_pairs >= expected_pairs:
+        placed_by_load: dict[str, int] = defaultdict(int)
+        related_entries_by_load: dict[str, list[ScheduleEntry]] = defaultdict(list)
+        for entry in entries:
+            if not entry.source_load_key:
                 continue
-            missing_pairs = expected_pairs - scheduled_pairs
-            group = groups.get(load.group_id)
-            subject = subjects.get(load.subject_id)
-            reason_parts: list[str] = []
-            study_weeks = study_weeks_by_group.get(load.group_id, 0)
-            if study_weeks == 0:
-                reason_parts.append("для семестра не заданы учебные недели")
-            teacher_mappings = session.exec(
-                select(GroupSubjectTeacher).where(
-                    GroupSubjectTeacher.group_id == load.group_id,
-                    GroupSubjectTeacher.subject_id == load.subject_id,
-                )
-            ).all()
-            teacher_allowed = teacher_mappings or session.exec(
-                select(TeacherSubject).where(
-                    TeacherSubject.subject_id == load.subject_id,
-                    TeacherSubject.can_teach.is_(True),
-                )
-            ).all()
-            if not teacher_allowed:
-                reason_parts.append("не назначен допустимый преподаватель")
-            if group is not None and study_weeks:
-                capacity = study_weeks * (len(DAYS) * len(allowed_pairs_for_shift(group.shift)) + len(self.online_slot_service.active_slots(session)))
-                if expected_pairs_by_group.get(load.group_id, 0) > capacity:
-                    reason_parts.append(
-                        f"суммарная нагрузка группы ({expected_pairs_by_group.get(load.group_id, 0)} пар) превышает общую вместимость основного и онлайн-слотов ({capacity} пар)"
-                    )
-            related_ids = ",".join(
-                str(entry.id)
-                for entry in grouped_entries.get((load.group_id, load.subject_id, ""), [])
-                if entry.id is not None
-            )
-            message = (
-                f"Не удалось разместить всю нагрузку по предмету "
-                f"\"{subject.name if subject else load.subject_id}\" для группы "
-                f"{group.code if group else load.group_id}: не хватает {missing_pairs} пар."
-            )
-            if reason_parts:
-                message += " Причина: " + "; ".join(reason_parts) + "."
+            placed_by_load[entry.source_load_key] += len(decode_week_scope(entry.week_scope))
+            related_entries_by_load[entry.source_load_key].append(entry)
+
+        for row in normalized_rows:
+            if row.excluded_status or row.total_pairs <= 0:
+                continue
+            placed_pairs = placed_by_load.get(row.load_key, 0)
+            if placed_pairs >= row.total_pairs:
+                continue
+            missing_pairs = row.total_pairs - placed_pairs
+            related_ids = ",".join(str(entry.id) for entry in related_entries_by_load.get(row.load_key, []) if entry.id is not None)
+            reason = self._unscheduled_reason(row)
             conflicts.append(
                 Conflict(
                     schedule_id=schedule.id or 0,
                     type="unscheduled_load",
                     severity="hard",
                     code="LOAD-MISSING",
-                    message=message,
-                    related_entry_ids=related_ids,
-                    details_json=json.dumps(
-                        {
-                            "group_id": load.group_id,
-                            "subject_id": load.subject_id,
-                            "expected_pairs": expected_pairs,
-                            "scheduled_pairs": scheduled_pairs,
-                            "missing_pairs": missing_pairs,
-                        }
+                    message=(
+                        f"Не удалось полностью разместить предмет «{row.subject_name}» для группы {row.group_code}"
+                        f"{f', подгруппа {row.subgroup_code}' if row.subgroup_code else ''}: не хватает {missing_pairs} пар. "
+                        f"Причина: {reason}"
                     ),
-                )
-            )
-        return conflicts
-
-    def _weekly_unscheduled_conflicts(
-        self,
-        session: Session,
-        schedule: Schedule,
-        entries: list[ScheduleEntry],
-        rows: list[WeeklyLoad],
-        grouped_entries: dict[tuple[int, int, str], list[ScheduleEntry]],
-        subjects: dict[int, Subject],
-        groups: dict[int, Group],
-    ) -> list[Conflict]:
-        conflicts: list[Conflict] = []
-        study_weeks_by_group: dict[int, int] = {}
-        expected_pairs_by_group: dict[int, int] = defaultdict(int)
-        relevant_group_ids = {entry.group_id for entry in entries} or {row.group_id for row in rows}
-        online_slot_count = len(self.online_slot_service.active_slots(session))
-        for row in rows:
-            if row.group_id not in relevant_group_ids:
-                continue
-            study_weeks = row.study_weeks or len(
-                session.exec(
-                    select(AcademicPeriod).where(
-                        AcademicPeriod.group_id == row.group_id,
-                        AcademicPeriod.semester == schedule.semester,
-                        AcademicPeriod.is_schedulable.is_(True),
-                    )
-                ).all()
-            )
-            study_weeks_by_group[row.group_id] = max(study_weeks_by_group.get(row.group_id, 0), study_weeks)
-            expected_pairs = max(int(round(row.total_hours / 2)), int(round((row.weekly_pairs or 0) * max(study_weeks, 1))), 1)
-            expected_pairs_by_group[row.group_id] += expected_pairs
-            key = (row.group_id, row.subject_id, row.subgroup_code or "")
-            scheduled_pairs = sum(len(decode_week_scope(entry.week_scope)) for entry in grouped_entries.get(key, []))
-            if scheduled_pairs >= expected_pairs:
-                continue
-            missing_pairs = expected_pairs - scheduled_pairs
-            group = groups.get(row.group_id)
-            subject = subjects.get(row.subject_id)
-            reason_parts: list[str] = []
-            if study_weeks <= 0:
-                reason_parts.append("для семестра не заданы учебные недели")
-            if row.assignment_state in {"vacancy", "unresolved_manual_review"} and not row.candidate_teacher_ids and not row.fixed_teacher_id:
-                reason_parts.append("для этой нагрузки не назначен преподаватель")
-            if row.assignment_state == "multi_teacher":
-                reason_parts.append("по строке задано несколько преподавателей, требуется уточнение")
-            if group is not None and study_weeks:
-                capacity = study_weeks * (len(DAYS) * len(allowed_pairs_for_shift(group.shift)) + online_slot_count)
-                if expected_pairs_by_group[row.group_id] > capacity:
-                    reason_parts.append(
-                        f"суммарная нагрузка группы ({expected_pairs_by_group[row.group_id]} пар) превышает общую вместимость основного и онлайн-слотов ({capacity} пар)"
-                    )
-            subgroup_text = f", подгруппа {row.subgroup_code}" if row.subgroup_code else ""
-            related_ids = ",".join(str(entry.id) for entry in grouped_entries.get(key, []) if entry.id is not None)
-            message = (
-                f"Не удалось разместить всю нагрузку по предмету "
-                f"\"{subject.name if subject else row.subject_id}\" для группы "
-                f"{group.code if group else row.group_id}{subgroup_text}: не хватает {missing_pairs} пар."
-            )
-            if reason_parts:
-                message += " Причина: " + "; ".join(reason_parts) + "."
-            conflicts.append(
-                Conflict(
-                    schedule_id=schedule.id or 0,
-                    type="unscheduled_load",
-                    severity="hard",
-                    code="LOAD-MISSING",
-                    message=message,
                     related_entry_ids=related_ids,
                     details_json=json.dumps(
                         {
                             "group_id": row.group_id,
                             "subject_id": row.subject_id,
                             "subgroup_code": row.subgroup_code,
-                            "expected_pairs": expected_pairs,
-                            "scheduled_pairs": scheduled_pairs,
+                            "expected_pairs": row.total_pairs,
+                            "placed_pairs": placed_pairs,
                             "missing_pairs": missing_pairs,
                             "assignment_state": row.assignment_state,
+                            "source_load_key": row.load_key,
                         }
                     ),
                 )
@@ -621,6 +497,31 @@ class ConflictEngine:
         if entry.lesson_mode == LESSON_MODE_ONLINE:
             return f"{day_label(entry.day_of_week)}, {online_slot_label(entry.online_slot_number or 1)}"
         return f"{day_label(entry.day_of_week)}, {pair_label(entry.pair_number)} ({pair_time_range(entry.pair_number)})"
+
+    @staticmethod
+    def _schedule_groups(session: Session, schedule: Schedule) -> list[Group]:
+        group_ids = ConflictEngine._schedule_group_ids(session, schedule)
+        if not group_ids:
+            return []
+        return session.exec(select(Group).where(Group.id.in_(group_ids))).all()
+
+    @staticmethod
+    def _unscheduled_reason(row) -> str:
+        if row.assignment_state == "vacancy":
+            return "для этой нагрузки не назначен преподаватель."
+        if row.assignment_state == "multi_teacher_ambiguous":
+            return "неоднозначное закрепление преподавателя по семестру."
+        if row.assignment_state == "multi_teacher":
+            return "в исходной строке указано несколько преподавателей, требуется уточнение."
+        if row.assignment_state == "unresolved_manual_review":
+            return "строка требует ручной проверки преподавателя."
+        if row.assignment_state == "candidate_pool" and not row.teacher_candidates:
+            return "не найден допустимый преподаватель."
+        if row.normalization_issue:
+            text = row.normalization_issue.rstrip(".")
+            if text:
+                return text[0].lower() + text[1:] + "."
+        return "не хватило свободных слотов без нарушения жёстких ограничений."
 
     @staticmethod
     def _schedule_group_ids(session: Session, schedule: Schedule) -> list[int]:

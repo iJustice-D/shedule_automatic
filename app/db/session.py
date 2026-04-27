@@ -147,6 +147,64 @@ def _recreate_scheduleentry_if_needed(connection: sqlite3.Connection) -> None:
     connection.execute("PRAGMA foreign_keys=ON")
 
 
+def _recreate_generationjob_if_needed(connection: sqlite3.Connection) -> None:
+    columns = _table_columns(connection, "generationjob")
+    if not columns:
+        return
+    needs_recreate = columns.get("group_id", {}).get("notnull") == 1
+    if not needs_recreate:
+        return
+    connection.execute("PRAGMA foreign_keys=OFF")
+    connection.execute(
+        """
+        CREATE TABLE generationjob_new (
+            id INTEGER NOT NULL PRIMARY KEY,
+            created_at TIMESTAMP NOT NULL,
+            started_at TIMESTAMP,
+            finished_at TIMESTAMP,
+            status VARCHAR DEFAULT 'pending',
+            group_id INTEGER,
+            semester INTEGER NOT NULL,
+            run_scope VARCHAR DEFAULT 'single_group',
+            group_scope VARCHAR DEFAULT '',
+            generation_mode VARCHAR DEFAULT 'best_effort',
+            include_facultatives BOOLEAN DEFAULT 0,
+            enable_online BOOLEAN DEFAULT 1,
+            source_scope VARCHAR DEFAULT 'normalized_weekly',
+            progress_percent INTEGER DEFAULT 0,
+            summary_message VARCHAR DEFAULT '',
+            requested_name VARCHAR DEFAULT '',
+            result_schedule_id INTEGER,
+            FOREIGN KEY(group_id) REFERENCES "group" (id),
+            FOREIGN KEY(result_schedule_id) REFERENCES schedule (id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO generationjob_new (
+            id, created_at, started_at, finished_at, status, group_id, semester, run_scope, group_scope,
+            generation_mode, include_facultatives, enable_online, source_scope, progress_percent,
+            summary_message, requested_name, result_schedule_id
+        )
+        SELECT
+            id, created_at, started_at, finished_at, status, group_id, semester,
+            COALESCE(run_scope, 'single_group'),
+            COALESCE(group_scope, ''),
+            generation_mode, include_facultatives, enable_online, source_scope, progress_percent,
+            summary_message, requested_name, result_schedule_id
+        FROM generationjob
+        """
+    )
+    connection.execute("DROP TABLE generationjob")
+    connection.execute("ALTER TABLE generationjob_new RENAME TO generationjob")
+    connection.execute("CREATE INDEX IF NOT EXISTS ix_generationjob_status ON generationjob (status)")
+    connection.execute("CREATE INDEX IF NOT EXISTS ix_generationjob_group_id ON generationjob (group_id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS ix_generationjob_semester ON generationjob (semester)")
+    connection.execute("CREATE INDEX IF NOT EXISTS ix_generationjob_result_schedule_id ON generationjob (result_schedule_id)")
+    connection.execute("PRAGMA foreign_keys=ON")
+
+
 def _migrate_sqlite_schema() -> None:
     db_path = _sqlite_db_path()
     if db_path is None or not db_path.exists():
@@ -161,8 +219,10 @@ def _migrate_sqlite_schema() -> None:
                 started_at TIMESTAMP,
                 finished_at TIMESTAMP,
                 status VARCHAR DEFAULT 'pending',
-                group_id INTEGER NOT NULL,
+                group_id INTEGER,
                 semester INTEGER NOT NULL,
+                run_scope VARCHAR DEFAULT 'single_group',
+                group_scope VARCHAR DEFAULT '',
                 generation_mode VARCHAR DEFAULT 'best_effort',
                 include_facultatives BOOLEAN DEFAULT 0,
                 enable_online BOOLEAN DEFAULT 1,
@@ -180,14 +240,33 @@ def _migrate_sqlite_schema() -> None:
         connection.execute("CREATE INDEX IF NOT EXISTS ix_generationjob_group_id ON generationjob (group_id)")
         connection.execute("CREATE INDEX IF NOT EXISTS ix_generationjob_semester ON generationjob (semester)")
         connection.execute("CREATE INDEX IF NOT EXISTS ix_generationjob_result_schedule_id ON generationjob (result_schedule_id)")
+        _ensure_column(connection, "generationjob", "run_scope", "VARCHAR DEFAULT 'single_group'")
+        _ensure_column(connection, "generationjob", "group_scope", "VARCHAR DEFAULT ''")
+        _recreate_generationjob_if_needed(connection)
         _ensure_column(connection, "group", "year", "INTEGER DEFAULT 1")
         _ensure_column(connection, "group", "shift", "VARCHAR DEFAULT 'morning'")
+        _ensure_column(connection, "group", "program", "VARCHAR DEFAULT ''")
+        _ensure_column(connection, "group", "source_group_family", "VARCHAR DEFAULT ''")
+        _ensure_column(connection, "group", "is_active", "BOOLEAN DEFAULT 1")
+        _ensure_column(connection, "group", "is_demo", "BOOLEAN DEFAULT 0")
+        _ensure_column(connection, "group", "is_manual", "BOOLEAN DEFAULT 0")
         _ensure_column(connection, "subject", "can_be_online", "BOOLEAN DEFAULT 0")
         _ensure_column(connection, "subject", "default_delivery_mode", "VARCHAR DEFAULT 'offline'")
+        _ensure_column(connection, "subject", "normalized_name", "VARCHAR DEFAULT ''")
+        _ensure_column(connection, "subject", "is_active", "BOOLEAN DEFAULT 1")
+        _ensure_column(connection, "subject", "is_demo", "BOOLEAN DEFAULT 0")
+        _ensure_column(connection, "subject", "canonical_subject_id", "INTEGER")
+        connection.execute("CREATE INDEX IF NOT EXISTS ix_subject_normalized_name ON subject (normalized_name)")
+        connection.execute("CREATE INDEX IF NOT EXISTS ix_subject_canonical_subject_id ON subject (canonical_subject_id)")
+        _ensure_column(connection, "teacher", "is_active", "BOOLEAN DEFAULT 1")
+        _ensure_column(connection, "teacher", "is_demo", "BOOLEAN DEFAULT 0")
+        _ensure_column(connection, "teacher", "is_manual", "BOOLEAN DEFAULT 0")
         _ensure_column(connection, "timeslot", "shift", "VARCHAR DEFAULT 'morning'")
         _ensure_column(connection, "timeslot", "start_time", "VARCHAR DEFAULT ''")
         _ensure_column(connection, "timeslot", "end_time", "VARCHAR DEFAULT ''")
         _ensure_column(connection, "schedule", "group_scope", "VARCHAR DEFAULT ''")
+        _ensure_column(connection, "schedule", "generation_job_id", "INTEGER")
+        connection.execute("CREATE INDEX IF NOT EXISTS ix_schedule_generation_job_id ON schedule (generation_job_id)")
         _ensure_column(connection, "curriculumload", "delivery_mode", "VARCHAR DEFAULT 'offline'")
         _ensure_column(connection, "curriculumload", "source_type", "VARCHAR DEFAULT 'imported'")
         _ensure_column(connection, "curriculumload", "note", "VARCHAR DEFAULT ''")
@@ -200,8 +279,27 @@ def _migrate_sqlite_schema() -> None:
         _ensure_column(connection, "scheduleentry", "lesson_mode", "VARCHAR DEFAULT 'regular'")
         _ensure_column(connection, "scheduleentry", "slot_category", "VARCHAR DEFAULT 'regular'")
         _ensure_column(connection, "scheduleentry", "subgroup_code", "VARCHAR")
+        _ensure_column(connection, "scheduleentry", "source_load_key", "VARCHAR DEFAULT ''")
+        _ensure_column(connection, "scheduleentry", "source_kind", "VARCHAR DEFAULT ''")
         connection.execute('UPDATE "group" SET year = course WHERE year IS NULL OR year = 0')
         connection.execute('UPDATE "group" SET shift = CASE WHEN shift IS NULL OR shift = "" THEN "morning" ELSE shift END')
+        connection.execute('UPDATE "group" SET program = CASE WHEN program IS NULL THEN "" ELSE program END')
+        connection.execute(
+            'UPDATE "group" SET source_group_family = CASE '
+            'WHEN source_group_family IS NULL OR source_group_family = "" THEN substr(code, 1, instr(code, "-") - 1) '
+            'ELSE source_group_family END'
+        )
+        connection.execute('UPDATE "group" SET is_active = 1 WHERE is_active IS NULL')
+        connection.execute('UPDATE "group" SET is_demo = 0 WHERE is_demo IS NULL')
+        connection.execute('UPDATE "group" SET is_manual = 0 WHERE is_manual IS NULL')
+        connection.execute('UPDATE generationjob SET run_scope = "single_group" WHERE run_scope IS NULL OR run_scope = ""')
+        connection.execute('UPDATE generationjob SET group_scope = "" WHERE group_scope IS NULL')
+        connection.execute('UPDATE teacher SET is_active = 1 WHERE is_active IS NULL')
+        connection.execute('UPDATE teacher SET is_demo = 0 WHERE is_demo IS NULL')
+        connection.execute('UPDATE teacher SET is_manual = 0 WHERE is_manual IS NULL')
+        connection.execute('UPDATE subject SET is_active = 1 WHERE is_active IS NULL')
+        connection.execute('UPDATE subject SET is_demo = 0 WHERE is_demo IS NULL')
+        connection.execute('UPDATE subject SET normalized_name = lower(trim(name)) WHERE normalized_name IS NULL OR normalized_name = ""')
         connection.execute(
             """
             UPDATE curriculumload
@@ -260,6 +358,14 @@ def _migrate_sqlite_schema() -> None:
                     WHEN delivery_mode = 'online' AND day_of_week = 5 THEN 3
                     WHEN delivery_mode = 'online' AND (online_slot_number IS NULL OR online_slot_number = 0) THEN 1
                     ELSE online_slot_number
+                END,
+                source_load_key = CASE
+                    WHEN source_load_key IS NULL THEN ''
+                    ELSE source_load_key
+                END,
+                source_kind = CASE
+                    WHEN source_kind IS NULL THEN ''
+                    ELSE source_kind
                 END,
                 pair_number = CASE
                     WHEN delivery_mode = 'online' THEN 0

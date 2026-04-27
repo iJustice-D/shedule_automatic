@@ -28,7 +28,7 @@ def test_calendar_importer_builds_real_etb_week_map() -> None:
     periods = importer.import_group_periods(BASE_DIR / "data" / "Үрдіс 2025-2026 оқу жылы соңғысы (1).pdf", "ETB-1124-1")
     sem3 = [item for item in periods if item.semester == 3 and item.is_schedulable]
     sem4 = [item for item in periods if item.semester == 4 and item.is_schedulable]
-    assert len(sem3) == 8
+    assert len(sem3) == 9
     assert len(sem4) == 8
     assert any(item.week_number == 42 and item.period_type == "final_attestation" for item in periods)
 
@@ -45,7 +45,7 @@ def test_weekly_workload_docx_importer_preserves_categories_and_assignments() ->
     assert any(row.is_practice for row in rows)
     assert any(row.subgroup_code in {"A", "B"} for row in rows)
     assert any(row.teacher_assignment_type == "vacancy" for row in rows)
-    assert any(row.teacher_assignment_type in {"fixed", "multi_teacher", "unresolved_manual_review"} for row in rows)
+    assert any(row.teacher_assignment_type in {"fixed", "multi_teacher_ambiguous", "unresolved_manual_review"} for row in rows)
 
 
 def test_weekly_workload_rows_drive_generation_without_teacher_parallel_conflicts() -> None:

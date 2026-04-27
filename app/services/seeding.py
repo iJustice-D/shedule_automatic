@@ -30,6 +30,7 @@ from app.models import (
 )
 from app.services.importers.academic_calendar_pdf import AcademicCalendarPdfImporter
 from app.services.importers.curriculum_xls import CurriculumXlsImporter
+from app.services.data_cleanup import DataCleanupService, normalize_visible_name
 from app.services.online_slots import OnlineSlotService
 from app.services.online_policy import OnlinePolicyService
 from app.services.weekly_workload import WeeklyWorkloadService
@@ -50,16 +51,27 @@ class Seeder:
         self.online_policy_service = OnlinePolicyService()
         self.online_slot_service = OnlineSlotService()
         self.weekly_workload_service = WeeklyWorkloadService()
+        self.data_cleanup_service = DataCleanupService()
 
-    def seed(self, session: Session, curriculum_path: Path, calendar_path: Path, weekly_workload_path: Path | None = None) -> None:
+    def seed(
+        self,
+        session: Session,
+        curriculum_path: Path,
+        calendar_path: Path,
+        weekly_workload_path: Path | None = None,
+        include_demo: bool | None = None,
+    ) -> None:
+        if include_demo is None:
+            include_demo = weekly_workload_path is None
         departments = self._ensure_departments(session)
         self._ensure_rooms(session)
         self._refresh_timeslots(session)
-        teachers = self._ensure_teachers(session, departments)
-        groups = self._ensure_groups(session, departments)
+        teachers = self._ensure_teachers(session, departments, include_demo=include_demo)
+        groups = self._ensure_groups(session, departments, include_demo=include_demo)
 
         self._seed_etb_group(session, groups["ETB-1124-1"], departments, teachers, curriculum_path, calendar_path)
-        self._seed_demo_groups(session, groups, departments, teachers)
+        if include_demo:
+            self._seed_demo_groups(session, groups, departments, teachers)
 
         self._upgrade_existing_groups(session)
         self._upgrade_existing_subjects(session)
@@ -73,6 +85,7 @@ class Seeder:
                 calendar_path=calendar_path,
                 curriculum_path=curriculum_path,
             )
+        self.data_cleanup_service.cleanup(session, hide_demo=not include_demo)
         session.commit()
 
     def _ensure_departments(self, session: Session) -> dict[str, Department]:
@@ -134,7 +147,7 @@ class Seeder:
             )
         session.commit()
 
-    def _ensure_teachers(self, session: Session, departments: dict[str, Department]) -> dict[str, Teacher]:
+    def _ensure_teachers(self, session: Session, departments: dict[str, Department], include_demo: bool) -> dict[str, Teacher]:
         specs = {
             "maksat": ("Maksat Nurpeisov", "M. Nurpeisov", "IT", 24),
             "aliya": ("Aliya Serik", "A. Serik", "IT", 22),
@@ -148,6 +161,8 @@ class Seeder:
             "erlan": ("Erlan Saparbayev", "E. Saparbayev", "IT", 20),
         }
         items: dict[str, Teacher] = {}
+        if not include_demo:
+            return items
         for key, (full_name, short_name, department_code, max_pairs) in specs.items():
             teacher = session.exec(select(Teacher).where(Teacher.full_name == full_name)).first()
             if teacher is None:
@@ -157,24 +172,31 @@ class Seeder:
                     home_department_id=departments[department_code].id or 0,
                     editable_name=full_name,
                     max_weekly_pairs=max_pairs,
+                    is_active=True,
+                    is_demo=True,
+                    is_manual=False,
                 )
             else:
                 teacher.short_name = short_name
                 teacher.editable_name = full_name
                 teacher.max_weekly_pairs = max_pairs
+                teacher.is_demo = True
             session.add(teacher)
             session.commit()
             session.refresh(teacher)
             items[key] = teacher
         return items
 
-    def _ensure_groups(self, session: Session, departments: dict[str, Department]) -> dict[str, Group]:
-        specs = {
-            "ETB-1124-1": {"student_count": 25, "course": 2, "semester": 4},
-            "DTP-2201": {"student_count": 22, "course": 2, "semester": 4},
-            "ETB-2202": {"student_count": 24, "course": 2, "semester": 4},
-            "IS-2201": {"student_count": 23, "course": 2, "semester": 4},
-        }
+    def _ensure_groups(self, session: Session, departments: dict[str, Department], include_demo: bool) -> dict[str, Group]:
+        specs = {"ETB-1124-1": {"student_count": 25, "course": 2, "semester": 4}}
+        if include_demo:
+            specs.update(
+                {
+                    "DTP-2201": {"student_count": 22, "course": 2, "semester": 4},
+                    "ETB-2202": {"student_count": 24, "course": 2, "semester": 4},
+                    "IS-2201": {"student_count": 23, "course": 2, "semester": 4},
+                }
+            )
         items: dict[str, Group] = {}
         for code, payload in specs.items():
             group = session.exec(select(Group).where(Group.code == code)).first()
@@ -188,6 +210,9 @@ class Seeder:
                     semester=payload["semester"],
                     student_count=payload["student_count"],
                     shift=GROUP_SHIFT_MAP[code],
+                    is_active=True,
+                    is_demo=code != "ETB-1124-1",
+                    is_manual=False,
                 )
             else:
                 group.name = code
@@ -197,6 +222,7 @@ class Seeder:
                 group.semester = payload["semester"]
                 group.student_count = payload["student_count"]
                 group.shift = GROUP_SHIFT_MAP[code]
+                group.is_demo = code != "ETB-1124-1"
             session.add(group)
             session.commit()
             session.refresh(group)
@@ -212,19 +238,20 @@ class Seeder:
         curriculum_path: Path,
         calendar_path: Path,
     ) -> None:
-        if not session.exec(select(AcademicPeriod).where(AcademicPeriod.group_id == group.id)).first():
-            periods = self.calendar_importer.import_group_periods(calendar_path, group.code)
-            for period in periods:
-                session.add(
-                    AcademicPeriod(
-                        group_id=group.id or 0,
-                        semester=period.semester,
-                        week_number=period.week_number,
-                        period_type=period.period_type,
-                        is_schedulable=period.is_schedulable,
-                    )
+        session.exec(delete(AcademicPeriod).where(AcademicPeriod.group_id == group.id))
+        session.commit()
+        periods = self.calendar_importer.import_group_periods(calendar_path, group.code)
+        for period in periods:
+            session.add(
+                AcademicPeriod(
+                    group_id=group.id or 0,
+                    semester=period.semester,
+                    week_number=period.week_number,
+                    period_type=period.period_type,
+                    is_schedulable=period.is_schedulable,
                 )
-            session.commit()
+            )
+        session.commit()
 
         loads = self.curriculum_importer.import_group_loads(curriculum_path, semesters=(3, 4))
         teacher_plan = {
@@ -244,11 +271,15 @@ class Seeder:
                 subject = Subject(
                     code=subject_code,
                     name=imported.subject_name,
+                    normalized_name=normalize_visible_name(imported.subject_name),
                     owner_department_id=departments[owner_code].id or 0,
                     lesson_type=imported.lesson_type,
                     requires_special_room=imported.requires_special_room,
                     can_be_online=imported.can_be_online,
                     default_delivery_mode=imported.default_delivery_mode,
+                    is_active=True,
+                    is_demo=False,
+                    canonical_subject_id=None,
                 )
                 session.add(subject)
                 session.commit()
@@ -261,6 +292,9 @@ class Seeder:
                 subject.requires_special_room = imported.requires_special_room
                 subject.can_be_online = imported.can_be_online
                 subject.default_delivery_mode = imported.default_delivery_mode
+                subject.normalized_name = normalize_visible_name(imported.subject_name)
+                subject.is_demo = False
+                subject.is_active = True
                 session.add(subject)
                 session.commit()
                 session.refresh(subject)
@@ -300,8 +334,10 @@ class Seeder:
                 )
                 session.commit()
 
-            teacher_keys = teacher_plan.get(imported.subject_name, ["maksat"])
-            self._ensure_teacher_mappings(session, group.id or 0, subject.id or 0, teacher_keys, teachers)
+            if teachers:
+                teacher_keys = teacher_plan.get(imported.subject_name, ["maksat"])
+                if all(key in teachers for key in teacher_keys):
+                    self._ensure_teacher_mappings(session, group.id or 0, subject.id or 0, teacher_keys, teachers)
 
     def _seed_demo_groups(
         self,
@@ -354,11 +390,15 @@ class Seeder:
                     subject = Subject(
                         code=code,
                         name=name,
+                        normalized_name=normalize_visible_name(name),
                         owner_department_id=departments["IT"].id or 0,
                         lesson_type=lesson_type,
                         requires_special_room=special_room,
                         can_be_online=can_be_online,
                         default_delivery_mode=DELIVERY_OFFLINE,
+                        is_active=True,
+                        is_demo=True,
+                        canonical_subject_id=None,
                     )
                     session.add(subject)
                     session.commit()
@@ -369,6 +409,9 @@ class Seeder:
                     subject.lesson_type = lesson_type
                     subject.requires_special_room = special_room
                     subject.can_be_online = can_be_online
+                    subject.normalized_name = normalize_visible_name(name)
+                    subject.is_demo = True
+                    subject.is_active = True
                     session.add(subject)
                     session.commit()
                     session.refresh(subject)
@@ -453,6 +496,8 @@ class Seeder:
                 group.shift = GROUP_SHIFT_MAP[group.code]
             elif not group.shift:
                 group.shift = SHIFT_MORNING
+            if group.code != "ETB-1124-1":
+                group.is_demo = group.is_demo or group.code in {"DTP-2201", "ETB-2202", "IS-2201"}
             session.add(group)
         session.commit()
 
@@ -462,6 +507,7 @@ class Seeder:
             subject.can_be_online = subject.can_be_online or self._is_online_capable(subject.name, subject.lesson_type)
             if not subject.default_delivery_mode:
                 subject.default_delivery_mode = DELIVERY_OFFLINE
+            subject.normalized_name = normalize_visible_name(subject.name)
             session.add(subject)
         session.commit()
 

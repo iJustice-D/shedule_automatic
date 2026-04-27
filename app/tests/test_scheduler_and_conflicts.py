@@ -8,10 +8,13 @@ from sqlmodel import Session, SQLModel, create_engine, select
 from app.core.timetable import LESSON_MODE_ONLINE, LESSON_MODE_REGULAR, ONLINE_ALLOWED_DAYS, visible_pairs_for_view
 from app.core.week_scope import format_week_scope
 from app.models import Conflict, CurriculumLoad, GenerationJob, Group, GroupSubjectTeacher, Schedule, ScheduleEntry, Subject, Teacher, TeacherSubject, Timeslot
+from app.services.scheduler.normalizer import WorkloadNormalizer
 from app.services.exporters.context import build_schedule_context
 from app.services.exporters.pdf_exporter import PdfExporter
 from app.services.seeding import Seeder
 from app.services.timetable_service import TimetableService
+from app.services.weekly_workload import WeeklyWorkloadService
+from app.ui.pages import slot_has_week_conflict
 
 
 BASE_DIR = Path(__file__).resolve().parents[2]
@@ -38,6 +41,84 @@ def test_schedule_generation_creates_entries_without_hard_conflicts() -> None:
     assert entries
     hard_types = {item.type for item in conflicts if item.severity == "hard"}
     assert hard_types <= {"unscheduled_load"}
+
+
+def test_semester3_normalization_uses_nine_study_weeks_and_marks_ambiguous_teacher_rows() -> None:
+    session = build_session()
+    WeeklyWorkloadService().import_docx(
+        session,
+        BASE_DIR / "data" / "2025-2026 ПРОГРАММИСТТЕР_ИНКАР (1) (2) (1).docx",
+        calendar_path=BASE_DIR / "data" / "Үрдіс 2025-2026 оқу жылы соңғысы (1).pdf",
+        curriculum_path=BASE_DIR / "data" / "Оқу жоспар_ЕТБ-1124.xls",
+        target_group_codes=["ETB-1124-1"],
+    )
+
+    normalizer = WorkloadNormalizer()
+    _, rows, requests = normalizer.normalize_scope(
+        session,
+        semester=3,
+        group_codes=["ETB-1124-1"],
+        include_facultatives=False,
+    )
+
+    economics_rows = [row for row in rows if "Экономиканың" in row.subject_name]
+    assert len(economics_rows) == 1
+    economics = economics_rows[0]
+    assert economics.assignment_state == "multi_teacher_ambiguous"
+    assert economics.study_weeks == [1, 2, 3, 4, 5, 6, 7, 8, 9]
+    assert economics.normalization_issue == "Неоднозначное закрепление преподавателя по семестру."
+    assert all(request.load_key != economics.load_key for request in requests)
+
+
+def test_semester3_generation_reports_ambiguous_rows_as_unscheduled_not_teacher_overlap() -> None:
+    session = build_session()
+    WeeklyWorkloadService().import_docx(
+        session,
+        BASE_DIR / "data" / "2025-2026 ПРОГРАММИСТТЕР_ИНКАР (1) (2) (1).docx",
+        calendar_path=BASE_DIR / "data" / "Үрдіс 2025-2026 оқу жылы соңғысы (1).pdf",
+        curriculum_path=BASE_DIR / "data" / "Оқу жоспар_ЕТБ-1124.xls",
+        target_group_codes=["ETB-1124-1"],
+    )
+    service = TimetableService()
+    schedule = service.generate_schedule(session, semester=3, group_codes=["ETB-1124-1"], name="Semester 3 ETB")
+    conflicts = session.exec(select(Conflict).where(Conflict.schedule_id == schedule.id)).all()
+
+    assert not any(item.code in {"TEACHER-OVERLAP", "GROUP-OVERLAP"} for item in conflicts)
+    assert any(
+        item.code == "LOAD-MISSING" and "неоднозначное закрепление преподавателя" in item.message.lower()
+        for item in conflicts
+    )
+
+    group = session.exec(select(Group).where(Group.code == "ETB-1124-1")).first()
+    assert group is not None
+    diagnostics = service.result_diagnostics(session, schedule.id or 0, group.id or 0)
+    economics = next(row for row in diagnostics["subject_rows"] if "Экономиканың" in row["subject"])
+    assert economics["status"] == "Требуется уточнение преподавателя"
+    assert "Неоднозначное закрепление преподавателя" in economics["reason"]
+
+
+def test_editor_conflict_badge_ignores_parallel_subgroups_with_same_weeks() -> None:
+    session = build_session()
+    WeeklyWorkloadService().import_docx(
+        session,
+        BASE_DIR / "data" / "2025-2026 ПРОГРАММИСТТЕР_ИНКАР (1) (2) (1).docx",
+        calendar_path=BASE_DIR / "data" / "Үрдіс 2025-2026 оқу жылы соңғысы (1).pdf",
+        curriculum_path=BASE_DIR / "data" / "Оқу жоспар_ЕТБ-1124.xls",
+        target_group_codes=["ETB-1124-1"],
+    )
+    service = TimetableService()
+    schedule = service.generate_schedule(session, semester=3, group_codes=["ETB-1124-1"], name="Semester 3 subgroup view")
+    entries = session.exec(
+        select(ScheduleEntry).where(
+            ScheduleEntry.schedule_id == schedule.id,
+            ScheduleEntry.day_of_week == 1,
+            ScheduleEntry.pair_number == 1,
+        )
+    ).all()
+
+    assert len(entries) >= 2
+    assert {entry.subgroup_code for entry in entries} == {"A", "B"}
+    assert slot_has_week_conflict(entries) is False
 
 
 def test_timeslots_are_seeded_with_real_college_pairs() -> None:
@@ -388,3 +469,99 @@ def test_generation_job_fails_without_workload() -> None:
         "Для выбранной группы нет учебной нагрузки.",
         "Невозможно запустить генерацию: отсутствуют нормализованные данные.",
     }
+
+
+def test_all_groups_generation_job_creates_scoped_results_without_teacher_parallel() -> None:
+    session = build_session()
+    service = TimetableService()
+    service.import_weekly_workload(
+        session,
+        BASE_DIR / "data" / "2025-2026 ПРОГРАММИСТТЕР_ИНКАР (1) (2) (1).docx",
+        calendar_path=BASE_DIR / "data" / "Үрдіс 2025-2026 оқу жылы соңғысы (1).pdf",
+        curriculum_path=BASE_DIR / "data" / "Оқу жоспар_ЕТБ-1124.xls",
+        group_codes=["ETB-1124-1", "ETB-0924-1", "ETB-0924-2"],
+    )
+
+    job = service.create_generation_job(
+        session,
+        group_id=None,
+        semester=4,
+        requested_name="All groups sem4",
+        run_scope="all_groups",
+        group_codes=["ETB-1124-1", "ETB-0924-1", "ETB-0924-2"],
+    )
+    finished = service.run_generation_job(job.id or 0)
+
+    assert finished.status == "completed"
+    results = service.job_results(session, finished.id or 0)
+    assert len(results) >= 2
+    assert {item.group_scope for item in results} >= {"ETB-1124-1", "ETB-0924-1"}
+
+    all_entries = []
+    for schedule in results:
+        all_entries.extend(session.exec(select(ScheduleEntry).where(ScheduleEntry.schedule_id == schedule.id)).all())
+
+    for i, left in enumerate(all_entries):
+        for right in all_entries[i + 1 :]:
+            if left.teacher_id != right.teacher_id:
+                continue
+            if left.day_of_week != right.day_of_week:
+                continue
+            if not format_week_scope(left.week_scope) or not format_week_scope(right.week_scope):
+                continue
+            if left.start_time and right.start_time:
+                same_time = left.start_time == right.start_time and left.end_time == right.end_time
+            else:
+                same_time = left.online_slot_number == right.online_slot_number and left.day_of_week == right.day_of_week
+            if same_time:
+                from app.core.week_scope import scopes_overlap
+
+                assert not scopes_overlap(left.week_scope, right.week_scope)
+
+    etb_group = session.exec(select(Group).where(Group.code == "ETB-1124-1")).first()
+    assert etb_group is not None
+    latest = service.latest_result_for_scope(session, group_id=etb_group.id or 0, semester=4)
+    assert latest is not None
+    assert latest.generation_job_id == (finished.id or 0)
+
+
+def test_real_seed_hides_demo_groups_and_teachers_by_default() -> None:
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine)
+    session = Session(engine)
+    Seeder().seed(
+        session,
+        BASE_DIR / "data" / "Оқу жоспар_ЕТБ-1124.xls",
+        BASE_DIR / "data" / "Үрдіс 2025-2026 оқу жылы соңғысы (1).pdf",
+        BASE_DIR / "data" / "2025-2026 ПРОГРАММИСТТЕР_ИНКАР (1) (2) (1).docx",
+    )
+    service = TimetableService()
+    groups = service.list_groups(session)
+    teachers = service.list_teachers(session)
+
+    assert all(group.code not in {"DTP-2201", "ETB-2202", "IS-2201"} for group in groups)
+    assert all(teacher.full_name not in {"Maksat Nurpeisov", "Aliya Serik"} for teacher in teachers)
+
+
+def test_duplicate_subject_name_is_rejected() -> None:
+    session = build_session()
+    service = TimetableService()
+    existing = service.list_subjects(session)[0]
+
+    try:
+        service.create_subject(
+            session,
+            {
+                "code": "DUPLICATE-SUBJECT-CODE",
+                "name": f"  {existing.name}  ",
+                "owner_department_id": existing.owner_department_id,
+                "lesson_type": existing.lesson_type,
+                "requires_special_room": existing.requires_special_room,
+                "can_be_online": existing.can_be_online,
+                "default_delivery_mode": existing.default_delivery_mode,
+            },
+        )
+    except ValueError as exc:
+        assert str(exc) == "Предмет с таким названием уже существует."
+    else:
+        raise AssertionError("Ожидалась ошибка дублирования предмета.")

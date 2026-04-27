@@ -10,7 +10,12 @@ from app.services.seeding import Seeder
 def main() -> None:
     init_db()
     with Session(engine) as session:
-        Seeder().seed(session, settings.curriculum_source, settings.calendar_source)
+        Seeder().seed(
+            session,
+            settings.curriculum_source,
+            settings.calendar_source,
+            include_demo=True,
+        )
     print("Database seeded.")
 
 

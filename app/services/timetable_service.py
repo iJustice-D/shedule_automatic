@@ -53,6 +53,7 @@ from app.models import (
 from app.services.ai.dummy import DummyExplanationProvider
 from app.services.ai.gemini_provider import GeminiExplanationProvider
 from app.services.conflicts.engine import ConflictEngine
+from app.services.data_cleanup import DataCleanupService, normalize_visible_name
 from app.services.exporters.context import build_schedule_context
 from app.services.exporters.docx_exporter import DocxExporter
 from app.services.exporters.pdf_exporter import PdfExporter
@@ -60,6 +61,8 @@ from app.services.exporters.xlsx_exporter import XlsxExporter
 from app.services.online_policy import OnlinePolicyService
 from app.services.online_slots import OnlineSlotService
 from app.services.scheduler.generator import HybridScheduleGenerator
+from app.services.scheduler.diagnostics import ResultDiagnosticsService
+from app.services.scheduler.repair import LocalRepairService
 from app.services.suggestions.engine import SuggestionEngine
 from app.services.weekly_workload import WeeklyWorkloadService
 
@@ -68,6 +71,8 @@ class TimetableService:
     def __init__(self) -> None:
         self.engine = engine
         self.generator = HybridScheduleGenerator()
+        self.diagnostics_service = ResultDiagnosticsService()
+        self.local_repair_service = LocalRepairService()
         self.conflict_engine = ConflictEngine()
         self.suggestion_engine = SuggestionEngine()
         self.xlsx_exporter = XlsxExporter()
@@ -76,6 +81,7 @@ class TimetableService:
         self.online_policy_service = OnlinePolicyService()
         self.online_slot_service = OnlineSlotService()
         self.weekly_workload_service = WeeklyWorkloadService()
+        self.data_cleanup_service = DataCleanupService()
 
     def generate_schedule(
         self,
@@ -85,6 +91,7 @@ class TimetableService:
         name: str | None = None,
         include_facultatives: bool = False,
         enable_online: bool = True,
+        generation_job_id: int | None = None,
     ) -> Schedule:
         schedule = self.generator.generate(
             session,
@@ -93,9 +100,34 @@ class TimetableService:
             schedule_name=name,
             include_facultatives=include_facultatives,
             enable_online=enable_online,
+            generation_job_id=generation_job_id,
         )
         self.revalidate_schedule(session, schedule.id or 0)
         return session.get(Schedule, schedule.id)
+
+    def generate_all_group_schedules(
+        self,
+        session: Session,
+        *,
+        semester: int,
+        group_codes: list[str] | None = None,
+        name: str | None = None,
+        include_facultatives: bool = False,
+        enable_online: bool = True,
+        generation_job_id: int | None = None,
+    ) -> list[Schedule]:
+        schedules = self.generator.generate_run(
+            session,
+            semester=semester,
+            group_codes=group_codes,
+            schedule_name=name,
+            include_facultatives=include_facultatives,
+            enable_online=enable_online,
+            generation_job_id=generation_job_id,
+        )
+        for schedule in schedules:
+            self.revalidate_schedule(session, schedule.id or 0)
+        return [session.get(Schedule, schedule.id) for schedule in schedules if schedule.id]
 
     @staticmethod
     def _utcnow() -> datetime:
@@ -105,21 +137,36 @@ class TimetableService:
         self,
         session: Session,
         *,
-        group_id: int,
+        group_id: int | None,
         semester: int,
         requested_name: str = "",
         generation_mode: str = "best_effort",
         include_facultatives: bool = False,
         enable_online: bool = True,
         source_scope: str = "normalized_weekly",
+        run_scope: str = "single_group",
+        group_codes: list[str] | None = None,
     ) -> GenerationJob:
         self.engine = session.get_bind()
-        group = session.get(Group, group_id)
-        if group is None:
-            raise ValueError("Выбранная группа не найдена.")
+        group_scope_codes = list(group_codes or [])
+        if run_scope == "single_group":
+            if group_id is None:
+                raise ValueError("Выбранная группа не найдена.")
+            group = session.get(Group, group_id)
+            if group is None:
+                raise ValueError("Выбранная группа не найдена.")
+            if not group_scope_codes:
+                group_scope_codes = [group.code]
+        else:
+            if not group_scope_codes:
+                group_scope_codes = self.available_generation_group_codes(session, semester=semester)
+            if not group_scope_codes:
+                raise ValueError("Для выбранного семестра не найдено групп с нормализованной нагрузкой.")
         job = GenerationJob(
             group_id=group_id,
             semester=semester,
+            run_scope=run_scope,
+            group_scope=",".join(group_scope_codes),
             requested_name=requested_name,
             generation_mode=generation_mode,
             include_facultatives=include_facultatives,
@@ -150,20 +197,53 @@ class TimetableService:
         return session.exec(query.limit(limit)).all()
 
     def latest_result_for_scope(self, session: Session, *, group_id: int, semester: int) -> Schedule | None:
-        job = session.exec(
-            select(GenerationJob).where(
-                GenerationJob.group_id == group_id,
-                GenerationJob.semester == semester,
-                GenerationJob.status == "completed",
-                GenerationJob.result_schedule_id.is_not(None),
-            ).order_by(GenerationJob.finished_at.desc(), GenerationJob.created_at.desc())
-        ).first()
-        if job is None or not job.result_schedule_id:
+        group = session.get(Group, group_id)
+        if group is None:
             return None
-        return session.get(Schedule, job.result_schedule_id)
+        return session.exec(
+            select(Schedule).where(
+                Schedule.semester == semester,
+                Schedule.group_scope == group.code,
+            ).order_by(Schedule.created_at.desc())
+        ).first()
+
+    def list_results_for_scope(
+        self,
+        session: Session,
+        *,
+        group_id: int,
+        semester: int,
+        limit: int = 30,
+    ) -> list[Schedule]:
+        group = session.get(Group, group_id)
+        if group is None:
+            return []
+        return session.exec(
+            select(Schedule).where(
+                Schedule.semester == semester,
+                Schedule.group_scope == group.code,
+            ).order_by(Schedule.created_at.desc()).limit(limit)
+        ).all()
+
+    def job_results(self, session: Session, job_id: int) -> list[Schedule]:
+        return session.exec(
+            select(Schedule).where(Schedule.generation_job_id == job_id).order_by(Schedule.group_scope, Schedule.created_at)
+        ).all()
 
     def get_generation_job(self, session: Session, job_id: int) -> GenerationJob | None:
         return session.get(GenerationJob, job_id)
+
+    def available_generation_group_codes(self, session: Session, *, semester: int) -> list[str]:
+        group_ids = set(self.weekly_workload_service.active_group_ids(session, semester=semester))
+        manual_group_ids = {
+            row.group_id
+            for row in session.exec(select(CurriculumLoad).where(CurriculumLoad.semester == semester)).all()
+        }
+        group_ids.update(manual_group_ids)
+        if not group_ids:
+            return []
+        groups = session.exec(select(Group).where(Group.id.in_(group_ids), Group.is_active.is_(True)).order_by(Group.code)).all()
+        return [group.code for group in groups]
 
     def run_generation_job(self, job_id: int) -> GenerationJob:
         try:
@@ -172,15 +252,20 @@ class TimetableService:
                 job = session.get(GenerationJob, job_id)
                 if job is None:
                     raise ValueError("Запуск генерации не найден.")
-                group = session.get(Group, job.group_id)
-                if group is None:
+                group = session.get(Group, job.group_id) if job.group_id else None
+                job_group_codes = self._job_group_codes(session, job)
+                if job.run_scope == "single_group" and group is None:
                     raise ValueError("Выбранная группа не найдена.")
+                if not job_group_codes:
+                    raise ValueError("Невозможно запустить генерацию: отсутствуют нормализованные данные.")
 
                 self._update_job(job_id, progress=20, message="Нормализация нагрузки")
-                weekly_rows = self.weekly_workload_service.active_rows(session, semester=job.semester, group_ids=[group.id or 0])
+                target_groups = session.exec(select(Group).where(Group.code.in_(job_group_codes))).all()
+                target_group_ids = [item.id or 0 for item in target_groups]
+                weekly_rows = self.weekly_workload_service.active_rows(session, semester=job.semester, group_ids=target_group_ids)
                 manual_rows = session.exec(
                     select(CurriculumLoad).where(
-                        CurriculumLoad.group_id == group.id,
+                        CurriculumLoad.group_id.in_(target_group_ids),
                         CurriculumLoad.semester == job.semester,
                     )
                 ).all()
@@ -192,42 +277,58 @@ class TimetableService:
                 if job.source_scope == "normalized_weekly" and not weekly_rows and not manual_rows:
                     raise ValueError("Невозможно запустить генерацию: отсутствуют нормализованные данные.")
                 if not relevant_weekly and not manual_rows:
-                    raise ValueError("Для выбранной группы нет учебной нагрузки.")
+                    raise ValueError("Для выбранной группы нет учебной нагрузки." if job.run_scope == "single_group" else "Для выбранного семестра нет учебной нагрузки по активным группам.")
 
                 study_weeks = session.exec(
                     select(AcademicPeriod).where(
-                        AcademicPeriod.group_id == group.id,
+                        AcademicPeriod.group_id.in_(target_group_ids),
                         AcademicPeriod.semester == job.semester,
                         AcademicPeriod.is_schedulable.is_(True),
                     )
                 ).all()
-                if not study_weeks:
+                if not study_weeks and not weekly_rows and not manual_rows:
                     raise ValueError("Для выбранного семестра нет доступных учебных недель.")
-                if not group.shift:
-                    raise ValueError("Невозможно запустить генерацию: для группы не указана смена.")
+                if any(not item.shift for item in target_groups):
+                    raise ValueError("Невозможно запустить генерацию: для одной из групп не указана смена.")
 
                 self._update_job(job_id, progress=35, message="Проверка выполнимости")
-                feasibility_message = self._feasibility_message(session, group, job.semester, relevant_weekly, manual_rows, job.enable_online)
-                self._update_job(job_id, progress=50, message="Генерация расписания")
-                schedule = self.generate_schedule(
+                feasibility = self.generator.feasibility(
                     session,
                     semester=job.semester,
-                    group_codes=[group.code],
-                    name=job.requested_name or f"Расписание {group.code} семестр {job.semester}",
+                    group_codes=job_group_codes,
                     include_facultatives=job.include_facultatives,
                     enable_online=job.enable_online,
                 )
+                feasibility_message = self._feasibility_message(group, feasibility, run_scope=job.run_scope, group_count=len(job_group_codes))
+                self._update_job(job_id, progress=50, message="Генерация расписания")
+                schedules = self.generate_all_group_schedules(
+                    session,
+                    semester=job.semester,
+                    group_codes=job_group_codes,
+                    name=job.requested_name or (f"Расписание {group.code} семестр {job.semester}" if group else f"Расписание всех групп семестр {job.semester}"),
+                    include_facultatives=job.include_facultatives,
+                    enable_online=job.enable_online,
+                    generation_job_id=job.id or 0,
+                )
+                if not schedules:
+                    raise ValueError("Расписание для выбранной группы не было построено.")
 
                 self._update_job(job_id, progress=80, message="Локальная оптимизация")
-                diagnostics = self.result_diagnostics(session, schedule.id or 0, group.id or 0)
-                summary = self._job_summary(group, job.semester, diagnostics, feasibility_message)
+                if job.run_scope == "single_group":
+                    schedule = schedules[0]
+                    diagnostics = self.result_diagnostics(session, schedule.id or 0, group.id or 0 if group else None)
+                    summary = self._job_summary(group, job.semester, diagnostics, feasibility_message)
+                    result_schedule_id = schedule.id or 0
+                else:
+                    summary = self._all_groups_job_summary(session, job, schedules, feasibility_message)
+                    result_schedule_id = schedules[0].id or 0
                 self._update_job(
                     job_id,
                     status="completed",
                     progress=100,
                     message=summary,
                     finished=True,
-                    result_schedule_id=schedule.id or 0,
+                    result_schedule_id=result_schedule_id,
                 )
         except Exception as exc:
             self._update_job(job_id, status="failed", progress=100, message=str(exc), finished=True)
@@ -298,6 +399,9 @@ class TimetableService:
             session.add(teacher_subject)
             entry.teacher_id = reassign_teacher_id
         if payload.get("subject_id") is not None:
+            if payload["subject_id"] != entry.subject_id:
+                entry.source_load_key = ""
+                entry.source_kind = "manual_override"
             entry.subject_id = payload["subject_id"]
         for field in ("day_of_week", "pair_number", "teacher_id", "locked", "online_slot_number", "lesson_mode"):
             if payload.get(field) is not None:
@@ -338,6 +442,14 @@ class TimetableService:
             )
         )
         session.commit()
+        schedule = session.get(Schedule, entry.schedule_id)
+        if schedule is not None:
+            self.local_repair_service.repair_schedule_scope(
+                session,
+                schedule_id=entry.schedule_id,
+                semester=schedule.semester,
+                group_ids=[entry.group_id],
+            )
         self.revalidate_schedule(session, entry.schedule_id)
         return entry
 
@@ -348,6 +460,9 @@ class TimetableService:
             home_department_id=home_department_id,
             editable_name=full_name,
             max_weekly_pairs=max_weekly_pairs,
+            is_active=True,
+            is_demo=False,
+            is_manual=True,
         )
         session.add(teacher)
         session.commit()
@@ -371,7 +486,7 @@ class TimetableService:
         existing = session.exec(select(Group).where(Group.code == payload["code"])).first()
         if existing is not None:
             raise ValueError("Группа с таким кодом уже существует.")
-        group = Group(**payload)
+        group = Group(**payload, is_active=True, is_demo=False, is_manual=True)
         session.add(group)
         session.commit()
         session.refresh(group)
@@ -407,7 +522,13 @@ class TimetableService:
         existing = session.exec(select(Subject).where(Subject.code == payload["code"])).first()
         if existing is not None:
             raise ValueError("Предмет с таким кодом уже существует.")
-        subject = Subject(**payload)
+        subject = Subject(
+            **payload,
+            normalized_name=normalize_visible_name(payload["name"]),
+            is_active=True,
+            is_demo=False,
+            canonical_subject_id=None,
+        )
         session.add(subject)
         session.commit()
         session.refresh(subject)
@@ -420,6 +541,9 @@ class TimetableService:
         self._validate_subject_payload(session, payload, current_subject_id=subject_id)
         for key, value in payload.items():
             setattr(subject, key, value)
+        subject.normalized_name = normalize_visible_name(subject.name)
+        subject.is_active = True
+        subject.canonical_subject_id = None
         session.add(subject)
         session.commit()
         session.refresh(subject)
@@ -531,12 +655,35 @@ class TimetableService:
     ) -> list[WeeklyLoad]:
         if not docx_path.exists():
             raise ValueError("Файл недельной нагрузки не найден.")
-        return self.weekly_workload_service.import_docx(
+        rows = self.weekly_workload_service.import_docx(
             session,
             docx_path,
             calendar_path=calendar_path,
             curriculum_path=curriculum_path,
             target_group_codes=group_codes,
+        )
+        self.data_cleanup_service.cleanup(session)
+        return rows
+
+    def cleanup_reference_data(self, session: Session) -> None:
+        self.data_cleanup_service.cleanup(session)
+
+    def list_groups(self, session: Session, include_inactive: bool = False) -> list[Group]:
+        return self.data_cleanup_service.list_groups(session, include_inactive=include_inactive)
+
+    def list_teachers(self, session: Session, include_inactive: bool = False) -> list[Teacher]:
+        return self.data_cleanup_service.list_teachers(session, include_inactive=include_inactive)
+
+    def list_subjects(
+        self,
+        session: Session,
+        include_inactive: bool = False,
+        include_duplicates: bool = False,
+    ) -> list[Subject]:
+        return self.data_cleanup_service.list_subjects(
+            session,
+            include_inactive=include_inactive,
+            include_duplicates=include_duplicates,
         )
 
     def teacher_balance_report(self, session: Session) -> list[dict[str, object]]:
@@ -575,37 +722,19 @@ class TimetableService:
             session.add(job)
             session.commit()
 
-    def _feasibility_message(
-        self,
-        session: Session,
-        group: Group,
-        semester: int,
-        weekly_rows: list[WeeklyLoad],
-        manual_rows: list[CurriculumLoad],
-        enable_online: bool,
-    ) -> str:
-        required_regular_pairs = round(
-            sum(row.weekly_pairs for row in weekly_rows if row.delivery_mode != DELIVERY_ONLINE) + sum(load.pairs_per_week for load in manual_rows),
-            2,
-        )
-        available_regular_slots = len(allowed_pairs_for_shift(group.shift)) * len(DAYS)
-        available_online_slots = len(self.online_slot_service.active_slots(session)) if enable_online else 0
-        unresolved_rows = sum(
-            1
-            for row in weekly_rows
-            if row.assignment_state in {"vacancy", "candidate_pool", "multi_teacher", "unresolved_manual_review"}
-        )
+    def _feasibility_message(self, group: Group | None, feasibility, *, run_scope: str, group_count: int = 1) -> str:
         parts = [
-            f"Ожидалось пар: {required_regular_pairs}",
-            f"Доступно обычных слотов: {available_regular_slots}",
-            f"Доступно онлайн-слотов: {available_online_slots}",
+            f"Ожидалось запросов: {feasibility.required_regular_requests}",
+            f"Доступно обычных слотов: {feasibility.regular_capacity}",
+            f"Доступно онлайн-слотов: {feasibility.online_capacity}",
         ]
-        if unresolved_rows:
-            parts.append(f"Неразрешённых строк: {unresolved_rows}")
-        if required_regular_pairs > available_regular_slots + available_online_slots:
-            parts.append(
-                f"Не хватает пар: {round(required_regular_pairs - available_regular_slots - available_online_slots, 2)}"
-            )
+        if feasibility.unresolved_rows:
+            parts.append(f"Неразрешённых строк: {feasibility.unresolved_rows}")
+        if feasibility.excluded_rows:
+            parts.append(f"Исключённых строк: {feasibility.excluded_rows}")
+        parts.extend(feasibility.warnings[:2])
+        if run_scope == "all_groups":
+            parts.insert(0, f"Групп в запуске: {group_count}")
         return ". ".join(parts)
 
     @staticmethod
@@ -621,6 +750,43 @@ class TimetableService:
             base += f" Жёстких конфликтов: {summary['hard_conflicts_count']}."
         return f"{base} {feasibility_message}".strip()
 
+    def _all_groups_job_summary(self, session: Session, job: GenerationJob, schedules: list[Schedule], feasibility_message: str) -> str:
+        total_groups = len(schedules)
+        fully = 0
+        partial = 0
+        infeasible = 0
+        unresolved = 0
+        teacher_balance = 0
+        for schedule in schedules:
+            group = session.exec(select(Group).where(Group.code == schedule.group_scope)).first()
+            diagnostics = self.result_diagnostics(session, schedule.id or 0, group.id or 0 if group else None)
+            summary = diagnostics["summary"]
+            if summary["not_placed_subjects_count"] == 0 and summary["partially_placed_subjects_count"] == 0:
+                fully += 1
+            elif summary["fully_placed_subjects_count"] > 0:
+                partial += 1
+            else:
+                infeasible += 1
+            unresolved += int(summary["unresolved_teacher_rows_count"])
+            teacher_balance += int(summary["teachers_with_balance_issue_count"])
+        return (
+            f"Все группы, семестр {job.semester}: обработано {total_groups}. "
+            f"Полностью размещено: {fully}. Частично размещено: {partial}. "
+            f"Невыполнимых/неполных групп: {infeasible}. "
+            f"Неразрешённых строк: {unresolved}. "
+            f"Предупреждений по балансу преподавателей: {teacher_balance}. "
+            f"{feasibility_message}"
+        ).strip()
+
+    def _job_group_codes(self, session: Session, job: GenerationJob) -> list[str]:
+        codes = [item.strip() for item in (job.group_scope or "").split(",") if item.strip()]
+        if codes:
+            return codes
+        if job.group_id:
+            group = session.get(Group, job.group_id)
+            return [group.code] if group else []
+        return self.available_generation_group_codes(session, semester=job.semester)
+
     def result_diagnostics(self, session: Session, schedule_id: int, group_id: int | None = None) -> dict[str, object]:
         schedule = session.get(Schedule, schedule_id)
         if schedule is None:
@@ -633,9 +799,6 @@ class TimetableService:
             entries_query = entries_query.where(ScheduleEntry.group_id.in_(scoped_group_ids))
         entries = session.exec(entries_query).all()
         entry_map = {entry.id or 0: entry for entry in entries}
-        group_map = {group.id: group for group in session.exec(select(Group)).all()}
-        subject_map = {subject.id: subject for subject in session.exec(select(Subject)).all()}
-
         conflicts = session.exec(select(Conflict).where(Conflict.schedule_id == schedule_id)).all()
         scoped_conflicts = [
             conflict
@@ -648,141 +811,39 @@ class TimetableService:
             if conflict.type != "unscheduled_load" and conflict.severity == "hard"
         ]
         unscheduled_conflicts = [conflict for conflict in scoped_conflicts if conflict.type == "unscheduled_load"]
-        warning_conflicts = [conflict for conflict in scoped_conflicts if conflict.severity != "hard"]
-
-        expected_rows = self._expected_subject_rows(session, schedule.semester, scoped_group_ids)
-        grouped_entries: dict[tuple[int, int, str], list[ScheduleEntry]] = defaultdict(list)
-        for entry in entries:
-            grouped_entries[(entry.group_id, entry.subject_id, entry.subgroup_code or "")].append(entry)
-
-        regular_capacities = self._group_regular_capacity(session, scoped_group_ids, schedule.semester)
-        online_targets = {group_id_: self.online_policy_service.get_target_for_group(session, group_map[group_id_]) for group_id_ in scoped_group_ids if group_id_ in group_map}
-        online_counts = defaultdict(int)
-        for entry in entries:
-            if entry.lesson_mode == LESSON_MODE_ONLINE:
-                online_counts[entry.group_id] += 1
-
-        subject_rows: list[dict[str, object]] = []
-        normalization_issues: list[dict[str, object]] = []
-        summary = {
-            "selected_group": group_map[scoped_group_ids[0]].code if len(scoped_group_ids) == 1 and scoped_group_ids[0] in group_map else "Несколько групп",
-            "selected_semester": schedule.semester,
-            "expected_subjects_count": 0,
-            "fully_placed_subjects_count": 0,
-            "partially_placed_subjects_count": 0,
-            "not_placed_subjects_count": 0,
-            "total_missing_pairs": 0,
-            "hard_conflicts_count": len(hard_conflicts),
-            "unscheduled_count": len(unscheduled_conflicts),
-            "warnings_count": len(warning_conflicts),
-            "unresolved_teacher_rows_count": 0,
-            "online_placed_count": sum(online_counts.values()),
-            "online_missing_count": 0,
-            "teachers_with_balance_issue_count": 0,
-        }
-
-        for row in expected_rows:
-            key = (row["group_id"], row["subject_id"], row["subgroup_code"])
-            placed_pairs = sum(len(decode_week_scope(entry.week_scope)) for entry in grouped_entries.get(key, []))
-            expected_pairs = int(row["expected_pairs"])
-            missing_pairs = max(expected_pairs - placed_pairs, 0)
-            status = "Полностью размещено"
-            reason = ""
-            if row["excluded_status"]:
-                status = str(row["excluded_status"])
-                reason = str(row["reason"])
-                placed_pairs = 0
-                missing_pairs = expected_pairs
-            elif missing_pairs and row["assignment_state"] in {"vacancy", "unresolved_manual_review", "multi_teacher", "candidate_pool"}:
-                status = "Требуется уточнение преподавателя"
-                reason = self._row_reason(row, regular_capacities)
-            elif missing_pairs and placed_pairs:
-                status = "Частично размещено"
-                reason = self._row_reason(row, regular_capacities)
-            elif missing_pairs:
-                status = "Не размещено"
-                reason = self._row_reason(row, regular_capacities)
-
-            subject_rows.append(
-                {
-                    "group_id": row["group_id"],
-                    "subject_id": row["subject_id"],
-                    "subject": row["subject_label"],
-                    "expected_pairs": expected_pairs,
-                    "placed_pairs": placed_pairs,
-                    "missing_pairs": missing_pairs,
-                    "status": status,
-                    "reason": reason,
-                    "assignment_state": row["assignment_state"],
-                    "is_excluded": bool(row["excluded_status"]),
-                }
-            )
-            summary["expected_subjects_count"] += 1
-            if status == "Полностью размещено":
-                summary["fully_placed_subjects_count"] += 1
-            elif status == "Частично размещено":
-                summary["partially_placed_subjects_count"] += 1
-                summary["total_missing_pairs"] += missing_pairs
-            elif status in {"Не размещено", "Требуется уточнение преподавателя", "Требуется уточнение подгруппы"}:
-                summary["not_placed_subjects_count"] += 1
-                summary["total_missing_pairs"] += missing_pairs
-
-            if row["assignment_state"] in {"vacancy", "unresolved_manual_review", "multi_teacher", "candidate_pool"}:
-                summary["unresolved_teacher_rows_count"] += 1
-                normalization_issues.append(
-                    {
-                        "subject": row["subject_label"],
-                        "state": row["assignment_state"],
-                        "message": self._normalization_message(row),
-                    }
-                )
-
-        relevant_teacher_ids = {
-            row["teacher_id"]
-            for row in self._group_teacher_links(session, scoped_group_ids, schedule.semester)
-            if row["teacher_id"]
-        }
-        balance_rows = [
-            item
-            for item in self.teacher_balance_report(session)
-            if item["teacher_id"] in relevant_teacher_ids
-        ]
-        balance_warnings = [
-            {
-                "teacher_name": item["teacher_name"],
-                "message": (
-                    f"Баланс нагрузки преподавателя нарушен: семестр 3 = {item['semester_3_pairs']} пар, "
-                    f"семестр 4 = {item['semester_4_pairs']} пар."
-                ),
-                "score": item["normalized_balance_score"],
-            }
-            for item in balance_rows
-            if float(item["normalized_balance_score"]) >= 2.0
-        ]
-        summary["teachers_with_balance_issue_count"] = len(balance_warnings)
-        warning_items: list[dict[str, object]] = [{"type": conflict.type, "message": conflict.message, "conflict": conflict} for conflict in warning_conflicts]
-        warning_items.extend(
-            {"type": "teacher_balance", "message": item["message"], "score": item["score"]}
-            for item in balance_warnings
+        warning_items = [{"type": conflict.type, "message": conflict.message, "conflict": conflict} for conflict in scoped_conflicts if conflict.severity != "hard"]
+        bundle = self.diagnostics_service.build(
+            session,
+            schedule_id=schedule_id,
+            group_id=group_id,
+            hard_conflicts=hard_conflicts,
+            unscheduled_conflicts=unscheduled_conflicts,
+            warnings=warning_items,
         )
-        summary["warnings_count"] = len(warning_items)
-
-        if scoped_group_ids:
-            summary["online_missing_count"] = sum(
-                max(online_targets.get(group_id_, 0) - online_counts.get(group_id_, 0), 0)
-                for group_id_ in scoped_group_ids
-            )
-
         return {
             "schedule": schedule,
             "entries": entries,
-            "summary": summary,
-            "subject_rows": sorted(subject_rows, key=lambda item: (item["status"] != "Не размещено", item["subject"])),
-            "hard_conflicts": hard_conflicts,
-            "unscheduled_conflicts": unscheduled_conflicts,
-            "warnings": warning_items,
-            "normalization_issues": normalization_issues,
-            "teacher_balance_rows": balance_rows,
+            "summary": bundle.summary,
+            "subject_rows": [
+                {
+                    "group_id": item.group_id,
+                    "subject_id": item.subject_id,
+                    "subject": item.subject,
+                    "expected_pairs": item.expected_pairs,
+                    "placed_pairs": item.placed_pairs,
+                    "missing_pairs": item.missing_pairs,
+                    "status": item.status,
+                    "reason": item.reason,
+                    "assignment_state": item.assignment_state,
+                    "subgroup_code": item.subgroup_code,
+                }
+                for item in bundle.subject_rows
+            ],
+            "hard_conflicts": bundle.hard_conflicts,
+            "unscheduled_conflicts": bundle.unscheduled_conflicts,
+            "warnings": bundle.warnings,
+            "normalization_issues": bundle.normalization_issues,
+            "teacher_balance_rows": bundle.teacher_balance_rows,
         }
 
     def upsert_online_slot(
@@ -986,6 +1047,16 @@ class TimetableService:
         existing = session.exec(select(Subject).where(Subject.code == code)).first()
         if existing is not None and existing.id != current_subject_id:
             raise ValueError("Предмет с таким кодом уже существует.")
+        normalized_name = normalize_visible_name(name)
+        duplicate = session.exec(
+            select(Subject).where(
+                Subject.normalized_name == normalized_name,
+                Subject.canonical_subject_id.is_(None),
+                Subject.is_active.is_(True),
+            )
+        ).first()
+        if duplicate is not None and duplicate.id != current_subject_id:
+            raise ValueError("Предмет с таким названием уже существует.")
 
     @staticmethod
     def _validate_load_payload(payload: dict) -> None:
@@ -1052,9 +1123,11 @@ class TimetableService:
             raise ValueError("Преподаватель не может вести этот предмет для выбранной группы.")
 
     def _validate_slot_availability(self, session: Session, entry: ScheduleEntry) -> None:
+        schedule = session.get(Schedule, entry.schedule_id)
+        related_schedule_ids = self._related_schedule_ids(session, schedule)
         others = session.exec(
             select(ScheduleEntry).where(
-                ScheduleEntry.schedule_id == entry.schedule_id,
+                ScheduleEntry.schedule_id.in_(related_schedule_ids),
                 ScheduleEntry.id != entry.id,
             )
         ).all()
@@ -1083,9 +1156,11 @@ class TimetableService:
 
     def _find_available_room(self, session: Session, entry: ScheduleEntry) -> Room | None:
         rooms = session.exec(select(Room).order_by(Room.code)).all()
+        schedule = session.get(Schedule, entry.schedule_id)
+        related_schedule_ids = self._related_schedule_ids(session, schedule)
         others = session.exec(
             select(ScheduleEntry).where(
-                ScheduleEntry.schedule_id == entry.schedule_id,
+                ScheduleEntry.schedule_id.in_(related_schedule_ids),
                 ScheduleEntry.id != entry.id,
                 ScheduleEntry.lesson_mode == LESSON_MODE_REGULAR,
                 ScheduleEntry.day_of_week == entry.day_of_week,
@@ -1103,6 +1178,17 @@ class TimetableService:
             if not room_busy:
                 return room
         return None
+
+    @staticmethod
+    def _related_schedule_ids(session: Session, schedule: Schedule | None) -> list[int]:
+        if schedule is None or schedule.id is None:
+            return []
+        if schedule.generation_job_id:
+            related = session.exec(
+                select(Schedule.id).where(Schedule.generation_job_id == schedule.generation_job_id)
+            ).all()
+            return [item for item in related if item is not None]
+        return [schedule.id]
 
     @staticmethod
     def _setting(session: Session, key: str) -> str:

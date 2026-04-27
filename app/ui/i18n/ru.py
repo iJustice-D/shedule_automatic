@@ -137,6 +137,7 @@ RU_TRANSLATIONS = {
         "teacher_created": "Преподаватель создан.",
         "teacher_renamed": "Имя преподавателя обновлено.",
         "need_teacher_and_department": "Нужно указать преподавателя и отделение.",
+        "show_archived": "Архивные преподаватели",
     },
     "groups": {
         "year": "Год обучения",
@@ -149,6 +150,7 @@ RU_TRANSLATIONS = {
         "updated": "Группа обновлена.",
         "deleted": "Группа удалена.",
         "choose": "Выберите группу",
+        "show_archived": "Архивные группы",
     },
     "subjects": {
         "add": "Добавить предмет",
@@ -163,6 +165,8 @@ RU_TRANSLATIONS = {
         "updated": "Предмет обновлен.",
         "deleted": "Предмет удален.",
         "choose": "Выберите предмет",
+        "show_archived": "Архивные предметы",
+        "show_duplicates": "Дубликаты предметов",
     },
     "calendar": {
         "period_type": "Тип периода",
@@ -192,6 +196,7 @@ RU_TRANSLATIONS = {
         "category_industrial_practice": "Производственная практика",
         "assignment_fixed": "Закреплен",
         "assignment_multi_teacher": "Несколько преподавателей",
+        "assignment_multi_teacher_ambiguous": "Неоднозначное закрепление преподавателя",
         "assignment_vacancy": "Вакансия",
         "assignment_unresolved_manual_review": "Требует ручной проверки",
         "assignment_candidate_pool": "Пул кандидатов",
@@ -239,6 +244,8 @@ RU_TRANSLATIONS = {
         "status_completed": "Завершено",
         "status_failed": "Ошибка",
         "open_result": "Открыть результат",
+        "all_groups": "Сгенерировать для всех групп",
+        "all_groups_label": "Все группы",
         "history": "История генерации",
         "history_empty": "Запусков генерации пока нет.",
         "include_facultatives": "Включать факультативы",

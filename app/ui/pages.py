@@ -133,6 +133,22 @@ def selection_options(rows: list, label_field: str = "code") -> dict[int, str]:
     return {row.id or 0: getattr(row, label_field) for row in rows}
 
 
+def load_groups(session: Session, include_inactive: bool = False) -> list[Group]:
+    return service.list_groups(session, include_inactive=include_inactive)
+
+
+def load_teachers(session: Session, include_inactive: bool = False) -> list[Teacher]:
+    return service.list_teachers(session, include_inactive=include_inactive)
+
+
+def load_subjects(
+    session: Session,
+    include_inactive: bool = False,
+    include_duplicates: bool = False,
+) -> list[Subject]:
+    return service.list_subjects(session, include_inactive=include_inactive, include_duplicates=include_duplicates)
+
+
 def shift_options(include_all: bool = False) -> dict[str, str]:
     options = {shift: shift_label(shift, lang=LANG) for shift in SHIFT_VALUES}
     if include_all:
@@ -224,16 +240,21 @@ def week_scope_label(value: str) -> str:
 
 def slot_has_week_conflict(entries: list[ScheduleEntry]) -> bool:
     for left, right in combinations(entries, 2):
-        if scopes_overlap(left.week_scope, right.week_scope):
-            return True
+        if not scopes_overlap(left.week_scope, right.week_scope):
+            continue
+        if left.subgroup_code and right.subgroup_code and left.subgroup_code != right.subgroup_code:
+            continue
+        return True
     return False
 
 
 def entry_caption(entry: ScheduleEntry, subjects: dict[int, Subject], teachers: dict[int, Teacher], rooms: dict[int, Room]) -> str:
     teacher = teachers[entry.teacher_id].editable_name or teachers[entry.teacher_id].full_name
     room_text = rooms[entry.room_id].code if entry.room_id and entry.room_id in rooms else tr("editor.remove_room")
+    subgroup_text = f"{tr('curriculum.subgroup')}: {entry.subgroup_code}\n" if entry.subgroup_code else ""
     return (
         f"{subjects[entry.subject_id].name}\n"
+        f"{subgroup_text}"
         f"{teacher}\n"
         f"{delivery_mode_label(entry.delivery_mode, lang=LANG)}\n"
         f"{room_text}\n"
@@ -267,8 +288,8 @@ def button_class_for_entry(entry: ScheduleEntry, conflict: bool = False) -> str:
 def dashboard_page() -> None:
     with page_shell(tr("page.dashboard")):
         with session_scope() as session:
-            groups = session.exec(select(Group)).all()
-            teachers = session.exec(select(Teacher)).all()
+            groups = load_groups(session)
+            teachers = load_teachers(session)
             schedules = session.exec(select(Schedule)).all()
             conflicts = session.exec(select(Conflict)).all()
         with ui.card().classes("hero-card w-full p-6"):
@@ -295,15 +316,17 @@ def groups_page() -> None:
     with page_shell(tr("page.groups")):
         with session_scope() as session:
             departments = session.exec(select(Department).order_by(Department.code)).all()
-        state = {"selected_group_id": None}
+        state = {"selected_group_id": None, "include_inactive": False}
 
         @ui.refreshable
         def render_groups() -> None:
             with session_scope() as session:
-                rows = session.exec(select(Group).order_by(Group.code)).all()
+                rows = load_groups(session, include_inactive=bool(state["include_inactive"]))
                 department_map = {item.id: item for item in session.exec(select(Department)).all()}
             if rows and state["selected_group_id"] not in {row.id for row in rows}:
                 state["selected_group_id"] = rows[0].id
+            if not rows:
+                state["selected_group_id"] = None
             ui.table(
                 columns=[
                     {"name": "code", "label": tr("groups.code"), "field": "code"},
@@ -326,6 +349,11 @@ def groups_page() -> None:
                 row_key="id",
             ).classes("panel-card w-full")
             with ui.row().classes("gap-3 mt-3 items-end"):
+                ui.switch(
+                    tr("groups.show_archived"),
+                    value=state["include_inactive"],
+                    on_change=lambda event: (state.update({"include_inactive": bool(event.value)}), render_groups.refresh()),
+                )
                 ui.select(
                     selection_options(rows),
                     value=state["selected_group_id"],
@@ -414,14 +442,16 @@ def teachers_page() -> None:
     with page_shell(tr("page.teachers")):
         with session_scope() as session:
             departments = session.exec(select(Department).order_by(Department.code)).all()
-        state = {"selected_teacher_id": None}
+        state = {"selected_teacher_id": None, "include_inactive": False}
 
         @ui.refreshable
         def render_management() -> None:
             with session_scope() as session:
-                rows = session.exec(select(Teacher).order_by(Teacher.full_name)).all()
+                rows = load_teachers(session, include_inactive=bool(state["include_inactive"]))
             if rows and state["selected_teacher_id"] is None:
                 state["selected_teacher_id"] = rows[0].id
+            if not rows:
+                state["selected_teacher_id"] = None
             ui.table(
                 columns=[
                     {"name": "full_name", "label": tr("teachers.full_name"), "field": "full_name"},
@@ -432,12 +462,18 @@ def teachers_page() -> None:
                 rows=[row.model_dump() for row in rows],
                 row_key="id",
             ).classes("panel-card w-full")
-            ui.select(
-                selection_options(rows, "full_name"),
-                value=state["selected_teacher_id"],
-                label=tr("teachers.teacher_to_rename"),
-                on_change=lambda event: state.update({"selected_teacher_id": event.value}),
-            ).classes("w-80")
+            with ui.row().classes("gap-3 items-end"):
+                ui.switch(
+                    tr("teachers.show_archived"),
+                    value=state["include_inactive"],
+                    on_change=lambda event: (state.update({"include_inactive": bool(event.value)}), render_management.refresh()),
+                )
+                ui.select(
+                    selection_options(rows, "full_name"),
+                    value=state["selected_teacher_id"],
+                    label=tr("teachers.teacher_to_rename"),
+                    on_change=lambda event: state.update({"selected_teacher_id": event.value}),
+                ).classes("w-80")
 
         render_management()
         with ui.row().classes("gap-3 mt-3"):
@@ -485,15 +521,21 @@ def subjects_page() -> None:
     with page_shell(tr("page.subjects")):
         with session_scope() as session:
             departments = session.exec(select(Department).order_by(Department.code)).all()
-        state = {"selected_subject_id": None}
+        state = {"selected_subject_id": None, "include_inactive": False, "include_duplicates": False}
 
         @ui.refreshable
         def render_subjects() -> None:
             with session_scope() as session:
-                rows = session.exec(select(Subject).order_by(Subject.name)).all()
+                rows = load_subjects(
+                    session,
+                    include_inactive=bool(state["include_inactive"]),
+                    include_duplicates=bool(state["include_duplicates"]),
+                )
                 department_map = {item.id: item for item in session.exec(select(Department)).all()}
             if rows and state["selected_subject_id"] not in {row.id for row in rows}:
                 state["selected_subject_id"] = rows[0].id
+            if not rows:
+                state["selected_subject_id"] = None
             ui.table(
                 columns=[
                     {"name": "code", "label": tr("subjects.code"), "field": "code"},
@@ -518,6 +560,16 @@ def subjects_page() -> None:
                 row_key="id",
             ).classes("panel-card w-full")
             with ui.row().classes("gap-3 mt-3 items-end"):
+                ui.switch(
+                    tr("subjects.show_archived"),
+                    value=state["include_inactive"],
+                    on_change=lambda event: (state.update({"include_inactive": bool(event.value)}), render_subjects.refresh()),
+                )
+                ui.switch(
+                    tr("subjects.show_duplicates"),
+                    value=state["include_duplicates"],
+                    on_change=lambda event: (state.update({"include_duplicates": bool(event.value)}), render_subjects.refresh()),
+                )
                 ui.select(
                     selection_options(rows, "name"),
                     value=state["selected_subject_id"],
@@ -602,7 +654,7 @@ def subjects_page() -> None:
 def calendar_page() -> None:
     with page_shell(tr("page.calendar")):
         with session_scope() as session:
-            groups = session.exec(select(Group).order_by(Group.code)).all()
+            groups = load_groups(session)
         state = {"group_id": groups[0].id if groups else None, "semester": 3}
 
         @ui.refreshable
@@ -654,8 +706,8 @@ def calendar_page() -> None:
 def curriculum_page() -> None:
     with page_shell(tr("page.curriculum")):
         with session_scope() as session:
-            groups = session.exec(select(Group).order_by(Group.code)).all()
-            subjects = session.exec(select(Subject).order_by(Subject.name)).all()
+            groups = load_groups(session)
+            subjects = load_subjects(session)
         state = {
             "group_id": groups[0].id if groups else None,
             "semester": 3,
@@ -737,7 +789,7 @@ def curriculum_page() -> None:
                                 "subgroup": row.subgroup_code or "—",
                                 "weekly_hours": row.weekly_hours,
                                 "weekly_pairs": row.weekly_pairs,
-                                "teacher_state": tr(f"curriculum.assignment_{row.assignment_state}") if row.assignment_state in {"fixed", "multi_teacher", "vacancy", "unresolved_manual_review", "candidate_pool"} else row.assignment_state,
+                                "teacher_state": tr(f"curriculum.assignment_{row.assignment_state}") if row.assignment_state in {"fixed", "multi_teacher", "multi_teacher_ambiguous", "vacancy", "unresolved_manual_review", "candidate_pool"} else row.assignment_state,
                                 "teachers": row.raw_teacher_names or "—",
                             }
                             for row in rows
@@ -755,7 +807,7 @@ def curriculum_page() -> None:
                             group_name = group_map.get(row.group_id).code if row.group_id in group_map else str(row.group_id)
                             ui.label(
                                 f"{group_name} | {subject_name} | "
-                                f"{tr(f'curriculum.assignment_{row.assignment_state}') if row.assignment_state in {'fixed', 'multi_teacher', 'vacancy', 'unresolved_manual_review', 'candidate_pool'} else row.assignment_state}"
+                                f"{tr(f'curriculum.assignment_{row.assignment_state}') if row.assignment_state in {'fixed', 'multi_teacher', 'multi_teacher_ambiguous', 'vacancy', 'unresolved_manual_review', 'candidate_pool'} else row.assignment_state}"
                             ).classes("text-sm")
                 with ui.card().classes("panel-card p-4 grow"):
                     ui.label(tr("curriculum.teacher_balance_title")).classes("text-lg font-semibold")
@@ -859,7 +911,7 @@ def curriculum_page() -> None:
             )
         def open_load_dialog(load_id: int | None = None) -> None:
             with session_scope() as session:
-                subjects_local = session.exec(select(Subject).order_by(Subject.name)).all()
+                subjects_local = load_subjects(session)
                 load = session.get(CurriculumLoad, load_id) if load_id else None
                 subject = session.get(Subject, load.subject_id) if load else None
             with ui.dialog() as dialog, ui.card().classes("panel-card p-5 min-w-[860px]"):
@@ -989,12 +1041,13 @@ def curriculum_page() -> None:
 def generator_page() -> None:
     with page_shell(tr("page.generator")):
         with session_scope() as session:
-            groups = session.exec(select(Group).order_by(Group.code)).all()
+            groups = load_groups(session)
         initial_group_id = groups[0].id if groups else None
         state = {
             "group_id": initial_group_id,
             "semester": 4,
             "latest_result_id": None,
+            "all_groups": False,
         }
 
         with ui.dialog() as generation_dialog, ui.card().classes("panel-card p-5 min-w-[620px]"):
@@ -1014,9 +1067,11 @@ def generator_page() -> None:
         with ui.row().classes("gap-3 w-full items-end"):
             group_select = ui.select(selection_options(groups), value=state["group_id"], label=tr("common.group")).classes("w-[26rem]")
             semester = ui.select({3: f"{tr('common.semester')} 3", 4: f"{tr('common.semester')} 4"}, value=state["semester"], label=tr("common.semester")).classes("w-56")
+            all_groups = ui.switch(tr("generator.all_groups"), value=False)
             include_facultatives = ui.switch(tr("generator.include_facultatives"), value=False)
             enable_online = ui.switch(tr("generator.enable_online"), value=True)
         schedule_name = ui.input(tr("generator.schedule_name"), value="").classes("w-full")
+        all_groups.on_value_change(lambda e: group_select.disable() if e.value else group_select.enable())
 
         @ui.refreshable
         def render_history() -> None:
@@ -1030,32 +1085,41 @@ def generator_page() -> None:
             with ui.column().classes("w-full gap-3"):
                 for job in jobs:
                     group = group_map.get(job.group_id)
+                    scope_label = group.code if group else tr("generator.all_groups_label")
                     with ui.card().classes("panel-card p-4 w-full"):
                         ui.label(
-                            f"{group.code if group else job.group_id} | {tr('common.semester')} {job.semester} | "
+                            f"{scope_label} | {tr('common.semester')} {job.semester} | "
                             f"{generation_status_label(job.status)}"
                         ).classes("font-semibold")
                         ui.label(job.summary_message or "—").classes("text-sm text-[#6b7280]")
                         with ui.row().classes("gap-2 mt-2"):
                             ui.label(f"ID: {job.id}").classes("text-xs text-[#6b7280]")
                             ui.label(str(job.created_at)).classes("text-xs text-[#6b7280]")
-                            if job.result_schedule_id:
+                            with session_scope() as session:
+                                job_results = service.job_results(session, job.id or 0)
+                            if job.result_schedule_id and not job_results:
                                 ui.button(
                                     tr("generator.open_result"),
                                     on_click=lambda result_id=job.result_schedule_id: ui.navigate.to(f"/editor/{result_id}"),
                                 ).props("outline color=dark")
+                            for schedule in job_results[:8]:
+                                ui.button(
+                                    f"{tr('generator.open_result')}: {schedule.group_scope}",
+                                    on_click=lambda result_id=schedule.id: ui.navigate.to(f"/editor/{result_id}"),
+                                ).props("outline color=dark")
 
         async def _generate_schedule() -> None:
-            if not group_select.value:
+            if not all_groups.value and not group_select.value:
                 ui.notify(tr("generator.group_required"), color="negative")
                 return
             try:
                 with session_scope() as session:
                     job = service.create_generation_job(
                         session,
-                        group_id=int(group_select.value),
+                        group_id=int(group_select.value) if group_select.value and not all_groups.value else None,
                         semester=int(semester.value),
                         requested_name=schedule_name.value or "",
+                        run_scope="all_groups" if all_groups.value else "single_group",
                         generation_mode="best_effort",
                         include_facultatives=bool(include_facultatives.value),
                         enable_online=bool(enable_online.value),
@@ -1095,7 +1159,8 @@ def generator_page() -> None:
                 return
             state["latest_result_id"] = finished_job.result_schedule_id
             open_result_button.enable()
-            ui.notify(tr("generator.created", name=f"{group_select.options.get(group_select.value, '')} / {tr('common.semester')} {semester.value}"), color="positive")
+            result_name = tr("generator.all_groups_label") if all_groups.value else f"{group_select.options.get(group_select.value, '')} / {tr('common.semester')} {semester.value}"
+            ui.notify(tr("generator.created", name=result_name), color="positive")
 
         ui.button(
             tr("generator.run"),
@@ -1107,8 +1172,8 @@ def generator_page() -> None:
 def _render_editor_page(result_id: int | None = None) -> None:
     with page_shell(tr("page.editor")):
         with session_scope() as session:
-            groups = session.exec(select(Group).order_by(Group.code)).all()
-            teachers = session.exec(select(Teacher).order_by(Teacher.full_name)).all()
+            groups = load_groups(session)
+            teachers = load_teachers(session)
             rooms = session.exec(select(Room).order_by(Room.code)).all()
             jobs = service.list_generation_jobs(session, limit=40)
         group_map = {group.id: group for group in groups}
@@ -1141,14 +1206,10 @@ def _render_editor_page(result_id: int | None = None) -> None:
             if group_id is None:
                 return {}
             with session_scope() as session:
-                scoped_jobs = service.list_generation_jobs(session, group_id=group_id, semester=semester, limit=30)
+                scoped_results = service.list_results_for_scope(session, group_id=group_id, semester=semester, limit=30)
             options: dict[int, str] = {}
-            for job in scoped_jobs:
-                if job.status != "completed" or not job.result_schedule_id:
-                    continue
-                options[job.result_schedule_id] = (
-                    f"#{job.id} | {generation_status_label(job.status)} | {job.created_at.strftime('%Y-%m-%d %H:%M:%S')}"
-                )
+            for schedule in scoped_results:
+                options[schedule.id or 0] = schedule.created_at.strftime("%Y-%m-%d %H:%M:%S")
             return options
 
         @ui.refreshable
@@ -1368,7 +1429,7 @@ def _render_editor_page(result_id: int | None = None) -> None:
             with session_scope() as session:
                 entry = session.get(ScheduleEntry, entry_id)
                 group = session.get(Group, entry.group_id)
-                teachers_local = session.exec(select(Teacher).order_by(Teacher.full_name)).all()
+                teachers_local = load_teachers(session)
                 rooms_local = session.exec(select(Room).order_by(Room.code)).all()
                 slot_labels = load_online_slot_labels(session)
                 online_slots = [slot for slot in load_online_slots(session) if slot.is_active]
@@ -1566,7 +1627,7 @@ def editor_page_result(result_id: int) -> None:
 def conflicts_page() -> None:
     with page_shell(tr("page.conflicts")):
         with session_scope() as session:
-            groups = session.exec(select(Group).order_by(Group.code)).all()
+            groups = load_groups(session)
             jobs = service.list_generation_jobs(session, limit=40)
         group_map = {group.id: group for group in groups}
         result_options = {
@@ -1632,7 +1693,8 @@ def conflicts_page() -> None:
                         ui.label(tr("curriculum.unresolved_empty")).classes("text-sm text-[#6b7280]")
                     else:
                         for row in global_unresolved[:20]:
-                            ui.label(f"{row.group_id} | {row.semester} | {row.assignment_state} | {row.raw_teacher_names or '—'}").classes("text-sm")
+                            label = tr(f"curriculum.assignment_{row.assignment_state}") if row.assignment_state in {"fixed", "multi_teacher", "multi_teacher_ambiguous", "vacancy", "unresolved_manual_review", "candidate_pool"} else row.assignment_state
+                            ui.label(f"{row.group_id} | {row.semester} | {label} | {row.raw_teacher_names or '—'}").classes("text-sm")
                 with ui.card().classes("panel-card p-4 grow"):
                     ui.label(tr("conflicts.global_balance")).classes("font-semibold")
                     if not global_balance:
@@ -1701,8 +1763,8 @@ def settings_page() -> None:
     with page_shell(tr("page.settings")):
         with session_scope() as session:
             current_settings = {item.key: item.value for item in session.exec(select(AppSetting)).all()}
-            groups = session.exec(select(Group).order_by(Group.code)).all()
-            subjects = session.exec(select(Subject).order_by(Subject.name)).all()
+            groups = load_groups(session)
+            subjects = load_subjects(session)
             online_slots = session.exec(select(OnlineSlot).order_by(OnlineSlot.order_index, OnlineSlot.id)).all()
             course_policies = {
                 policy.course: policy
@@ -1858,7 +1920,7 @@ def settings_page() -> None:
         @ui.refreshable
         def render_subject_policy() -> None:
             with session_scope() as session:
-                rows = session.exec(select(Subject).order_by(Subject.name)).all()
+                rows = load_subjects(session)
             ui.label(tr("settings.subject_policy")).classes("text-lg font-semibold mt-4")
             for subject in rows:
                 with ui.row().classes("panel-card w-full items-center p-3 gap-3"):

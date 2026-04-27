@@ -27,13 +27,13 @@ def health() -> dict[str, str]:
 
 
 @router.get("/groups")
-def list_groups(session: Session = Depends(get_session)):
-    return as_json(session.exec(select(Group).order_by(Group.code)).all())
+def list_groups(include_inactive: bool = False, session: Session = Depends(get_session)):
+    return as_json(service.list_groups(session, include_inactive=include_inactive))
 
 
 @router.get("/teachers")
-def list_teachers(session: Session = Depends(get_session)):
-    return as_json(session.exec(select(Teacher).order_by(Teacher.full_name)).all())
+def list_teachers(include_inactive: bool = False, session: Session = Depends(get_session)):
+    return as_json(service.list_teachers(session, include_inactive=include_inactive))
 
 
 @router.post("/teachers")
@@ -55,8 +55,12 @@ def rename_teacher(teacher_id: int, payload: TeacherRename, session: Session = D
 
 
 @router.get("/subjects")
-def list_subjects(session: Session = Depends(get_session)):
-    return as_json(session.exec(select(Subject).order_by(Subject.name)).all())
+def list_subjects(
+    include_inactive: bool = False,
+    include_duplicates: bool = False,
+    session: Session = Depends(get_session),
+):
+    return as_json(service.list_subjects(session, include_inactive=include_inactive, include_duplicates=include_duplicates))
 
 
 @router.get("/rooms")
@@ -141,19 +145,26 @@ def get_generation_job(job_id: int, session: Session = Depends(get_session)):
     return as_json(job)
 
 
+@router.get("/generation-jobs/{job_id}/results")
+def get_generation_job_results(job_id: int, session: Session = Depends(get_session)):
+    return as_json(service.job_results(session, job_id))
+
+
 @router.post("/schedules/generate")
 def generate_schedule(payload: GenerateRequest, session: Session = Depends(get_session)):
     group_id = payload.group_id
     if group_id is None and payload.group_codes:
         group = session.exec(select(Group).where(Group.code == payload.group_codes[0])).first()
         group_id = group.id if group else None
-    if group_id is None:
+    if group_id is None and not payload.all_groups:
         raise HTTPException(400, "Нужно выбрать группу для генерации.")
     job = service.create_generation_job(
         session,
         group_id=group_id,
         semester=payload.semester,
         requested_name=payload.name or "",
+        run_scope="all_groups" if payload.all_groups else "single_group",
+        group_codes=payload.group_codes,
         generation_mode=payload.generation_mode,
         include_facultatives=payload.include_facultatives,
         enable_online=payload.enable_online,
@@ -163,10 +174,12 @@ def generate_schedule(payload: GenerateRequest, session: Session = Depends(get_s
     if job.status != "completed" or not job.result_schedule_id:
         raise HTTPException(400, job.summary_message or "Расписание для выбранной группы не было построено.")
     schedule = session.get(Schedule, job.result_schedule_id)
-    data = as_json(schedule)
+    data = as_json(schedule) if schedule is not None else {}
     data["generation_job_id"] = job.id
     data["generation_status"] = job.status
     data["generation_summary"] = job.summary_message
+    data["run_scope"] = job.run_scope
+    data["result_count"] = len(service.job_results(session, job.id or 0))
     return data
 
 

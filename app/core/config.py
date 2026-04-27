@@ -33,6 +33,7 @@ class Settings:
         os.getenv("WEEKLY_WORKLOAD_SOURCE", str(BASE_DIR / "data" / "2025-2026 ПРОГРАММИСТТЕР_ИНКАР (1) (2) (1).docx")),
         str(Path("/Users/adiletongar/Downloads/2025-2026 ПРОГРАММИСТТЕР_ИНКАР (1) (2) (1).docx")),
     )
+    include_demo_seed: bool = os.getenv("INCLUDE_DEMO_SEED", "0") == "1"
 
 
 settings = Settings()

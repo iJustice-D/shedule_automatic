@@ -26,17 +26,26 @@ class Group(SQLModel, table=True):
     semester: int
     student_count: int
     shift: str = "morning"
+    program: str = ""
+    source_group_family: str = ""
+    is_active: bool = True
+    is_demo: bool = False
+    is_manual: bool = False
 
 
 class Subject(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     code: str = Field(index=True, unique=True)
     name: str
+    normalized_name: str = Field(default="", index=True)
     owner_department_id: int = Field(foreign_key="department.id")
     lesson_type: str
     requires_special_room: bool = False
     can_be_online: bool = False
     default_delivery_mode: str = "offline"
+    is_active: bool = True
+    is_demo: bool = False
+    canonical_subject_id: Optional[int] = Field(default=None, foreign_key="subject.id", index=True)
 
 
 class Teacher(SQLModel, table=True):
@@ -46,6 +55,9 @@ class Teacher(SQLModel, table=True):
     home_department_id: int = Field(foreign_key="department.id")
     editable_name: Optional[str] = None
     max_weekly_pairs: int = 20
+    is_active: bool = True
+    is_demo: bool = False
+    is_manual: bool = False
 
 
 class Room(SQLModel, table=True):
@@ -151,6 +163,7 @@ class Schedule(SQLModel, table=True):
     name: str
     semester: int = Field(index=True)
     group_scope: str = ""
+    generation_job_id: Optional[int] = Field(default=None, foreign_key="generationjob.id", index=True)
     created_at: datetime = Field(default_factory=utcnow)
 
 
@@ -160,8 +173,10 @@ class GenerationJob(SQLModel, table=True):
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
     status: str = Field(default="pending", index=True)
-    group_id: int = Field(foreign_key="group.id", index=True)
+    group_id: Optional[int] = Field(default=None, foreign_key="group.id", index=True)
     semester: int = Field(index=True)
+    run_scope: str = "single_group"
+    group_scope: str = ""
     generation_mode: str = "best_effort"
     include_facultatives: bool = False
     enable_online: bool = True
@@ -190,6 +205,8 @@ class ScheduleEntry(SQLModel, table=True):
     delivery_mode: str = "offline"
     subgroup_code: Optional[str] = None
     week_scope: str
+    source_load_key: str = ""
+    source_kind: str = ""
     locked: bool = False
 
 

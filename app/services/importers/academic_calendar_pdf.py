@@ -31,7 +31,7 @@ class AcademicCalendarPdfImporter:
         6: "study",
         7: "study",
         8: "study",
-        9: "industrial_practice",
+        9: "study",
         10: "industrial_practice",
         11: "industrial_practice",
         12: "industrial_practice",

@@ -273,7 +273,7 @@ class WeeklyWorkloadDocxImporter:
         if "vacancy" in states or "unresolved_manual_review" in states:
             return "unresolved_manual_review"
         if len(teacher_units) > 1:
-            return "multi_teacher"
+            return "multi_teacher_ambiguous"
         return next(iter(states), "unresolved_manual_review")
 
     def _subject_metadata(self, subject_text: str, category: str) -> tuple[str, str | None, str, bool, bool, str]:
@@ -402,4 +402,3 @@ class WeeklyWorkloadDocxImporter:
         normalized = value.upper().replace("І", "I")
         mapping = {"I": 1, "II": 2, "III": 3, "IV": 4}
         return mapping.get(normalized)
-

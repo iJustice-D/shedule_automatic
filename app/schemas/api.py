@@ -10,6 +10,7 @@ class GenerateRequest(BaseModel):
     semester: int = Field(ge=3, le=4)
     group_id: Optional[int] = None
     group_codes: list[str] = Field(default_factory=list)
+    all_groups: bool = False
     generation_mode: str = "best_effort"
     include_facultatives: bool = False
     enable_online: bool = True

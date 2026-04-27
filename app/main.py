@@ -21,6 +21,7 @@ def bootstrap() -> None:
             settings.curriculum_source,
             settings.calendar_source,
             settings.weekly_workload_source,
+            include_demo=settings.include_demo_seed,
         )
 
 
